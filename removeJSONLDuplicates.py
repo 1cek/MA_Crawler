@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Dedupliziert eine JSONL-Datei nach folgenden Regeln (in dieser Reihenfolge):
+Dedupliziert zwei JSONL-Dateien nach folgenden Regeln (in dieser Reihenfolge):
 
 1. Gleiche URL + gleicher Body → nur den frühesten Snapshot behalten.
 2. Gleiche ID, unterschiedlicher Body → ID umbenennen (suffix _2, _3, ...).
@@ -12,8 +12,8 @@ Nicht berührt:
 - Gleiche URL, unterschiedlicher Body → alle behalten (echte Versionen).
 
 Benutzung:
-  python3 deduplicate_jsonl.py input.jsonl
-  python3 deduplicate_jsonl.py input.jsonl -o output.jsonl
+  python3 deduplicate_jsonl.py input_1.jsonl input_2.jsonl
+  python3 deduplicate_jsonl.py input_1.jsonl input_2.jsonl -o output.jsonl
 """
 
 import json
@@ -32,7 +32,7 @@ def load_records(path: Path) -> list[dict]:
             try:
                 records.append(json.loads(line))
             except json.JSONDecodeError as e:
-                print(f"  ⚠️  Zeile {i} konnte nicht geparst werden: {e}")
+                print(f"  ⚠️  {path.name} Zeile {i} konnte nicht geparst werden: {e}")
     return records
 
 
@@ -44,7 +44,6 @@ def snapshot_sort_key(r: dict) -> tuple:
 # ── Regel 1: Gleiche URL + gleicher Body → frühesten Snapshot behalten ────────
 
 def rule1_same_url_same_body(records: list[dict]) -> tuple[list[dict], list[dict]]:
-    # Bestimme pro (url, body) den frühesten Eintrag
     winner: dict[tuple, dict] = {}
     for r in records:
         key = (r.get("url", ""), r.get("body", ""))
@@ -89,7 +88,6 @@ def rule2_rename_duplicate_ids(records: list[dict]) -> list[dict]:
 # ── Regel 3: Gleicher Body, verschiedene URLs → erste URL behalten ────────────
 
 def rule3_same_body_different_url(records: list[dict]) -> tuple[list[dict], list[dict]]:
-    # Bestimme pro Body den "frühesten" Eintrag
     winner: dict[str, dict] = {}
     for r in records:
         body = r.get("body", "")
@@ -112,8 +110,6 @@ def rule3_same_body_different_url(records: list[dict]) -> tuple[list[dict], list
             removed.append(r)
             print(f"  [Regel 3] Entfernt (gleicher Body): id={r.get('id')}  url={r.get('url','')[:70]}")
         else:
-            # Body noch nicht gesehen, aber nicht der Winner-Snapshot → trotzdem behalten
-            # (passiert wenn Winner bereits durch Regel 1 entfernt wurde – sicherheitshalber)
             seen_bodies.add(body)
             kept.append(r)
 
@@ -127,21 +123,30 @@ def write_jsonl(path: Path, records: list[dict]):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Dedupliziert eine JSONL-Datei.")
-    parser.add_argument("input", type=Path, help="Eingabe-JSONL-Datei")
+    parser = argparse.ArgumentParser(description="Dedupliziert zwei JSONL-Dateien zu einer.")
+    parser.add_argument("input1", type=Path, help="Erste Eingabe-JSONL-Datei")
+    parser.add_argument("input2", type=Path, help="Zweite Eingabe-JSONL-Datei")
     parser.add_argument("-o", "--output", type=Path, default=None,
-                        help="Ausgabe-JSONL (Standard: <input>_dedup.jsonl)")
+                        help="Ausgabe-JSONL (Standard: output_dedup.jsonl)")
     args = parser.parse_args()
 
-    if not args.input.exists():
-        print(f"❌ Datei nicht gefunden: {args.input}")
-        return
+    for p in (args.input1, args.input2):
+        if not p.exists():
+            print(f"❌ Datei nicht gefunden: {p}")
+            return
 
-    output = args.output or args.input.with_stem(args.input.stem + "_dedup")
+    output = args.output or Path("output_dedup.jsonl")
 
-    print(f"\n📂 Lese: {args.input}")
-    records = load_records(args.input)
-    print(f"   {len(records)} Einträge eingelesen\n")
+    print(f"\n📂 Lese: {args.input1}")
+    records1 = load_records(args.input1)
+    print(f"   {len(records1)} Einträge")
+
+    print(f"📂 Lese: {args.input2}")
+    records2 = load_records(args.input2)
+    print(f"   {len(records2)} Einträge")
+
+    records = records1 + records2
+    print(f"   {len(records)} Einträge gesamt\n")
 
     print("── Regel 1: Gleiche URL + gleicher Body ──────────────────────────────")
     records, removed1 = rule1_same_url_same_body(records)
