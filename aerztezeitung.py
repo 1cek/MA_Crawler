@@ -8,12 +8,29 @@ KI-bezogenen Keywords und schreibt pro Domain eine JSONL-Datei.
 Aufruf:
     python wayback_crawler.py --input root_domains.xlsx
 
+Robustheitsstufen für CDX-Queries (wichtig für stark archivierte Domains
+wie aerzteblatt.de, bfarm.de, rki.de):
+
+  1. Gesamtquery (ganzer Jahresbereich) mit Paginierung via resumeKey
+  2. Jahr-für-Jahr-Queries (paginiert)
+  3. Halbjahres-Sub-Fallback (paginiert)
+  4. Quartals-Sub-Sub-Fallback (paginiert)
+  5. Monats-Sub-Sub-Sub-Fallback (paginiert)          ← NEU
+  6. Letzter Ausweg: CDX mit collapse=timestamp:4     ← NEU
+     (ein Eintrag pro URL pro Jahr direkt vom Server)
+
+Paginierung via resumeKey ist die wichtigste Verbesserung: Wayback liefert
+große CDX-Ergebnisse in Seiten à CDX_PAGE_SIZE Zeilen. Der Server gibt am
+Ende jeder vollen Seite einen resumeKey zurück. Ohne Paginierung bricht
+Wayback bei sehr großen Domains still ab oder liefert ungültiges JSON.
+
 Siehe README.md für Details zu Output-Schema, Cache-Strategie und Resume.
 """
 
 from __future__ import annotations
 
 import argparse
+import calendar
 import gzip
 import hashlib
 import json
@@ -37,7 +54,7 @@ import requests
 import trafilatura
 try:
     from trafilatura.metadata import extract_metadata as _trafi_extract_metadata
-except ImportError:  # pragma: no cover - ältere trafilatura
+except ImportError:
     _trafi_extract_metadata = None  # type: ignore[assignment]
 from bs4 import BeautifulSoup
 from langdetect import DetectorFactory, LangDetectException, detect
@@ -53,51 +70,37 @@ from tenacity import (
 from tqdm import tqdm
 from w3lib.url import canonicalize_url
 
-# langdetect ist standardmäßig nicht-deterministisch: einmal fixieren.
 DetectorFactory.seed = 0
 
 
 # ============================== KONSTANTEN ===================================
 
 EXCLUDED_PATH_SUBSTRINGS = [
-    # Rechtliches / Meta-Seiten
     "/impressum", "/imprint",
     "/privacy", "/datenschutz",
     "/terms", "/conditions", "/legal", "/disclaimer",
     "/cookie", "/cookies",
     "/barrierefreiheit", "/accessibility",
     "/hilfe", "/help", "/faq",
-
-    # Auth / Account / Commerce
     "/login", "/log-in", "/signin", "/sign-in",
     "/signup", "/sign-up", "/register", "/registration",
     "/account", "/my-account", "/user/", "/users/",
     "/cart", "/checkout", "/warenkorb",
-
-    # Kontakt / Service / Standorte
     "/contact", "/kontakt",
     "/support", "/service", "/kundenservice",
     "/standorte", "/locations",
     "/office", "/offices",
-
-    # Karriere / Jobs
     "/jobs", "/job/", "/job-", "/careers", "/career",
     "/karriere", "/stellen", "/stellenangebote",
     "/vacancies", "/join-us", "/work-with-us",
     "/graduates", "/talent",
-
-    # Navigations-Indizes / Listings
     "/search", "/suche",
     "/category/", "/categories/",
     "/author/", "/authors/",
     "/profile/", "/profiles/",
     "/feed/", "/rss",
-
-    # Newsletter / Social
     "/newsletter", "/subscribe", "/subscription",
     "/share", "/sharing", "/social",
-
-    # Technische Pfade / CMS-internes
     "/wp-content/", "/wp-json/", "/wp-admin/",
     "/api/", "/ajax/", "/assets/", "/static/", "/_next/", "/cdn-cgi/",
 ]
@@ -184,6 +187,15 @@ USER_AGENT_DEFAULT = "WaybackResearchCrawler/1.0 (+mailto:research@example.com)"
 CDX_ENDPOINT = "http://web.archive.org/cdx/search/cdx"
 SNAPSHOT_TEMPLATE = "http://web.archive.org/web/{timestamp}id_/{url}"
 
+# Wie viele Zeilen pro CDX-Seite angefordert werden. Wayback gibt bei
+# Überschreitung des Limits einen resumeKey zurück. 50 000 ist konservativ
+# genug, dass auch schwache Server-Instanzen nicht abstürzen.
+CDX_PAGE_SIZE = 50_000
+
+# Maximale Gesamtzeilen pro CDX-Query (Sicherheitspuffer, falls eine Domain
+# wirklich absurd viel archiviert wurde und wir nicht ewig laden wollen).
+CDX_MAX_TOTAL_ROWS = 5_000_000
+
 BODY_MAX_CHARS = 200_000
 MIN_VALID_BODY_BYTES = 500
 WAYBACK_ERROR_MARKERS = (
@@ -208,13 +220,6 @@ ARTICLE_JSONLD_TYPES = {
     "ReviewNewsArticle",
 }
 
-
-# ============================== DATACLASSES ==================================
-
-
-# Pfad-Marker, die einen Bereich einer Seite eindeutig als deutschsprachig
-# ausweisen. Wird sowohl für Pfad-Präfix-Matching als auch für den
-# verschärften Sprachfilter bei kurzen Texten genutzt.
 GERMAN_PATH_MARKERS = (
     "/de",
     "/de-de",
@@ -226,22 +231,12 @@ GERMAN_PATH_MARKERS = (
 )
 
 
+# ============================== DATACLASSES ==================================
+
+
 @dataclass(frozen=True)
 class DomainTarget:
-    """Repräsentiert einen Eintrag aus der Input-Excel.
-
-    Die Input-Spalte kann entweder nur einen Host (``example.de``) oder einen
-    Host + Pfad-Präfix (``siemens.com/de``, ``bosch.com/germany``) enthalten.
-    ``DomainTarget`` normalisiert beides und hält beide Teile getrennt.
-
-    Attributes:
-        raw: Der ursprüngliche Eintrag aus der Excel, lowercased + getrimmt,
-            dient als Label in Output und progress.json.
-        host: Nur der Host, z.B. ``siemens.com``.
-        path_prefix: Normalisierter Pfad-Präfix (``/de``, ``/de-de``,
-            ``/germany`` …) oder leerer String, wenn nur ein Host angegeben war.
-        file_slug: Filesystem-safe Variante von ``raw``.
-    """
+    """Repräsentiert einen Eintrag aus der Input-Excel."""
 
     raw: str
     host: str
@@ -262,7 +257,7 @@ class CDXRow:
     """Ein Zeileneintrag aus dem CDX-Index."""
 
     urlkey: str
-    timestamp: str  # YYYYMMDDHHMMSS
+    timestamp: str
     original: str
     mimetype: str
     statuscode: str
@@ -271,13 +266,12 @@ class CDXRow:
 
     @property
     def capture_date(self) -> date:
-        """Tagesdatum des Captures."""
         return datetime.strptime(self.timestamp[:8], "%Y%m%d").date()
 
 
 @dataclass
 class ParsedRecord:
-    """Extrahierter und normalisierter Inhalt eines Snapshots (Cache-tauglich)."""
+    """Extrahierter und normalisierter Inhalt eines Snapshots."""
 
     url: str
     snapshot_timestamp: str
@@ -286,10 +280,10 @@ class ParsedRecord:
     skip_reason: Optional[str] = None
     body: Optional[str] = None
     body_truncated: bool = False
-    date_iso: Optional[str] = None  # YYYY-MM-DD (aufgefüllt)
-    date_precision: Optional[str] = None  # "day"|"month"|"year"
+    date_iso: Optional[str] = None
+    date_precision: Optional[str] = None
     date_source: Optional[str] = None
-    language: Optional[str] = None  # "de"|"de_assumed"|andere ISO-Codes
+    language: Optional[str] = None
     http_last_modified: Optional[str] = None
 
 
@@ -314,7 +308,7 @@ class DomainStats:
 
 @dataclass
 class Config:
-    """Zentrale Laufzeit-Konfiguration (aus CLI-Args)."""
+    """Zentrale Laufzeit-Konfiguration."""
 
     input_path: Path
     output_dir: Path
@@ -326,7 +320,6 @@ class Config:
     sample_seed: int
     years: range
     user_agent: str
-    # Abgeleitete Pfade:
     cache_dir: Path = field(default_factory=lambda: Path(".cache"))
     state_dir: Path = field(default_factory=lambda: Path("state"))
     logs_dir: Path = field(default_factory=lambda: Path("logs"))
@@ -349,27 +342,18 @@ class Config:
 
 
 # =============================== GLOBAL STATE ================================
-# Nur Shutdown-Flag und Locks, keine fachlichen Globals.
 
 _shutdown_requested = threading.Event()
 _rate_limit_lock = threading.Lock()
-_last_request_monotonic: list[float] = [0.0]  # boxed, damit mutable über Threads
+_last_request_monotonic: list[float] = [0.0]
 
 
 # ============================== LOGGING SETUP ================================
 
 
 def setup_logging(cfg: Config) -> dict[str, int]:
-    """Konfiguriert loguru und legt separate Sink-IDs für Skip-Logs an.
-
-    Returns:
-        Dict mit Sink-IDs pro Skip-Kategorie. Nicht strikt nötig, aber erlaubt
-        späteres Abräumen bei Tests.
-    """
     cfg.logs_dir.mkdir(parents=True, exist_ok=True)
-
     logger.remove()
-
     console_level = "DEBUG" if cfg.verbose else "INFO"
     logger.add(
         sys.stderr,
@@ -385,7 +369,6 @@ def setup_logging(cfg: Config) -> dict[str, int]:
         format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{line} | {message}",
     )
 
-    # Strukturierte Skip-Logs: je eine Datei, gefiltert über Record-Extra "skip".
     def _make_filter(tag: str):
         def _filter(record):
             return record["extra"].get("skip") == tag
@@ -415,7 +398,6 @@ def setup_logging(cfg: Config) -> dict[str, int]:
 
 
 def log_skip(tag: str, domain: str, url: str, reason: str) -> None:
-    """Hilfsfunktion: schreibt eine Zeile in das strukturierte Skip-Log."""
     logger.bind(skip=tag, domain=domain, url=url).info(reason)
 
 
@@ -423,22 +405,9 @@ def log_skip(tag: str, domain: str, url: str, reason: str) -> None:
 
 
 def parse_years_range(text: str) -> range:
-    """Parst einen String wie ``"2015-2025"`` zu einem ``range``.
-
-    Args:
-        text: Der Range-String im Format ``"START-END"`` (inklusive).
-
-    Returns:
-        Ein ``range`` von START bis END+1.
-
-    Raises:
-        ValueError: Bei ungültigem Format oder Reihenfolge.
-    """
     m = re.fullmatch(r"\s*(\d{4})\s*-\s*(\d{4})\s*", text)
     if not m:
-        raise ValueError(
-            f"Ungültiger years-Range '{text}', erwartet z.B. '2015-2025'"
-        )
+        raise ValueError(f"Ungültiger years-Range '{text}', erwartet z.B. '2015-2025'")
     start, end = int(m.group(1)), int(m.group(2))
     if start > end:
         raise ValueError(f"Start-Jahr {start} liegt nach End-Jahr {end}")
@@ -446,11 +415,6 @@ def parse_years_range(text: str) -> range:
 
 
 def rate_limit_wait(rate_limit: float) -> None:
-    """Blockiert, bis seit dem letzten Aufruf 1/rate_limit Sekunden vergangen sind.
-
-    Args:
-        rate_limit: Requests pro Sekunde. Werte <= 0 deaktivieren das Limit.
-    """
     if rate_limit <= 0:
         return
     min_interval = 1.0 / rate_limit
@@ -463,14 +427,9 @@ def rate_limit_wait(rate_limit: float) -> None:
 
 
 def _install_signal_handlers() -> None:
-    """Installiert SIGINT/SIGTERM-Handler, die nur das Shutdown-Flag setzen."""
-
     def _handler(signum, frame):  # noqa: ARG001
         if not _shutdown_requested.is_set():
-            logger.warning(
-                "Signal {} empfangen, beende nach aktueller URL sauber …",
-                signum,
-            )
+            logger.warning("Signal {} empfangen, beende nach aktueller URL sauber …", signum)
             _shutdown_requested.set()
         else:
             logger.error("Zweites Signal empfangen, breche hart ab.")
@@ -480,7 +439,6 @@ def _install_signal_handlers() -> None:
     try:
         signal.signal(signal.SIGTERM, _handler)
     except (ValueError, AttributeError):
-        # z.B. unter Windows nicht unterstützt
         pass
 
 
@@ -488,12 +446,6 @@ def _install_signal_handlers() -> None:
 
 
 def _sanitize_slug(raw: str) -> str:
-    """Wandelt ein Domain-Target in einen Filesystem-safen Slug.
-
-    ``siemens.com/de`` → ``siemens.com_de``, ``pfizer.com/de-de/``
-    → ``pfizer.com_de-de``. Nicht-alphanumerische Zeichen außer ``.-_`` werden
-    durch ``_`` ersetzt.
-    """
     s = raw.strip().strip("/").lower()
     s = re.sub(r"[\\/]+", "_", s)
     s = re.sub(r"[^a-z0-9._\-]+", "_", s)
@@ -502,67 +454,29 @@ def _sanitize_slug(raw: str) -> str:
 
 
 def _parse_domain_target(raw: str) -> Optional[DomainTarget]:
-    """Parst einen Excel-Eintrag zu einem ``DomainTarget``.
-
-    Akzeptiert Formen wie ``example.de``, ``https://siemens.com/de``,
-    ``bosch.com/germany/``, ``sap.com/de-de``. Scheme, Trailing-Slash und
-    ``www.`` werden entfernt; der Rest hinter dem Host wird als ``path_prefix``
-    behandelt (mit führendem ``/``, ohne Trailing-``/``).
-
-    Returns:
-        ``DomainTarget`` oder ``None``, wenn der Eintrag unbrauchbar ist
-        (leer, ohne Host).
-    """
     if not raw:
         return None
     s = str(raw).strip().lower()
     if not s:
         return None
-    # Scheme entfernen
     s = re.sub(r"^https?://", "", s)
-    # "www."-Prefix behalten? Viele Sites nutzen www., andere nicht. Für CDX
-    # mit matchType=domain spielt das keine Rolle (alle Subdomains inkludiert),
-    # für matchType=prefix aber schon. Wir lassen www. dran, wenn der User es
-    # so geschrieben hat — das ist explizites User-Intent.
-    # Trailing slash weg
     s = s.strip("/")
     if not s:
         return None
-
-    # Erste Aufteilung in Host vs. Rest
     if "/" in s:
         host, _, path_rest = s.partition("/")
     else:
         host, path_rest = s, ""
-
     if not host or "." not in host:
         return None
-
-    # path_prefix normalisieren: führendes "/", kein Trailing "/"
     path_prefix = ""
     if path_rest:
         path_prefix = "/" + path_rest.strip("/")
-
     slug = _sanitize_slug(s)
-    return DomainTarget(
-        raw=s, host=host, path_prefix=path_prefix, file_slug=slug
-    )
+    return DomainTarget(raw=s, host=host, path_prefix=path_prefix, file_slug=slug)
 
 
 def load_domains(path: Path) -> list[DomainTarget]:
-    """Lädt die Spalte ``domain`` aus der Input-Excel-Datei und parst jedes Feld.
-
-    Args:
-        path: Pfad zur ``.xlsx``-Datei.
-
-    Returns:
-        Liste von ``DomainTarget`` in Reihenfolge der Datei, dedupliziert auf
-        ``raw``.
-
-    Raises:
-        FileNotFoundError: Wenn die Datei nicht existiert.
-        ValueError: Wenn die Pflichtspalte ``domain`` fehlt oder leer ist.
-    """
     if not path.exists():
         raise FileNotFoundError(f"Input-Datei nicht gefunden: {path}")
     df = pd.read_excel(path, engine="openpyxl")
@@ -589,16 +503,6 @@ def load_domains(path: Path) -> list[DomainTarget]:
 
 
 def _url_path_starts_with_prefix(url: str, prefix: str) -> bool:
-    """Prüft, ob der URL-Pfad mit dem angegebenen Präfix beginnt.
-
-    Case-insensitive Vergleich. Ein Präfix ``/de`` matcht ``/de``,
-    ``/de/foo``, ``/de-de/…``, aber NICHT ``/design`` oder ``/dev`` — nach dem
-    Präfix muss entweder das Pfad-Ende, ein ``/`` oder ein Trenner stehen.
-
-    Args:
-        url: Vollständige URL.
-        prefix: Normalisierter Pfad-Präfix (mit führendem ``/``, ohne Trailing-``/``).
-    """
     if not prefix:
         return True
     try:
@@ -610,18 +514,12 @@ def _url_path_starts_with_prefix(url: str, prefix: str) -> bool:
     if not path.startswith(pfx):
         return False
     tail = path[len(pfx):]
-    # Nach dem Präfix muss Ende, ``/`` oder ein Delimiter folgen.
     if tail == "" or tail.startswith("/"):
         return True
     return False
 
 
 def _url_matches_target(url: str, target: DomainTarget) -> bool:
-    """Prüft, ob eine URL zur Domain-Ziel-Spezifikation passt.
-
-    - Host muss gleich dem Target-Host sein oder eine Subdomain davon.
-    - Wenn Target einen ``path_prefix`` hat, muss der URL-Pfad damit beginnen.
-    """
     try:
         parsed = urlparse(url)
     except ValueError:
@@ -638,12 +536,6 @@ def _url_matches_target(url: str, target: DomainTarget) -> bool:
 
 
 def _url_has_german_marker(url: str) -> bool:
-    """Heuristik: True, wenn der Pfad einen eindeutigen DE-Marker enthält.
-
-    Wird als Fallback genutzt, wenn der Textkörper für ``langdetect`` zu kurz
-    ist. Beispiele: ``https://x.com/de/foo`` → True, ``https://x.com/de-de/…``
-    → True, ``https://x.com/news/…`` → False.
-    """
     try:
         parsed = urlparse(url)
     except ValueError:
@@ -656,7 +548,6 @@ def _url_has_german_marker(url: str) -> bool:
 
 
 def _host_has_de_tld(url: str) -> bool:
-    """True, wenn der Host der URL auf ``.de`` endet."""
     try:
         host = (urlparse(url).hostname or "").lower()
     except ValueError:
@@ -665,15 +556,6 @@ def _host_has_de_tld(url: str) -> bool:
 
 
 def is_excluded_path(url: str) -> bool:
-    """Prüft, ob der Pfad-Teil der URL einen ausgeschlossenen Substring enthält.
-
-    Args:
-        url: Absolute URL.
-
-    Returns:
-        True, wenn der Pfad (case-insensitive) einen Eintrag aus
-        ``EXCLUDED_PATH_SUBSTRINGS`` enthält.
-    """
     try:
         parsed = urlparse(url)
     except ValueError:
@@ -686,36 +568,17 @@ def is_excluded_path(url: str) -> bool:
 
 
 def normalize_url(url: str) -> str:
-    """Normalisiert eine URL für robuste Deduplizierung.
-
-    - Entfernt Tracking-Parameter aus ``TRACKING_PARAMS`` (case-insensitive)
-    - Entfernt das Fragment
-    - Vereinheitlicht den Trailing-Slash (nur Root behält ``/``)
-    - Sortiert verbleibende Query-Parameter alphabetisch (via w3lib)
-    - Lowercased Scheme und Host (via w3lib)
-
-    Args:
-        url: Eingabe-URL.
-
-    Returns:
-        Die normalisierte URL.
-    """
     parsed = urlparse(url)
-    # Tracking-Parameter entfernen
     if parsed.query:
         params = parse_qsl(parsed.query, keep_blank_values=True)
         tracking_lower = {p.lower() for p in TRACKING_PARAMS}
         filtered = [(k, v) for k, v in params if k.lower() not in tracking_lower]
         new_query = urlencode(filtered, doseq=True)
         parsed = parsed._replace(query=new_query)
-    # Fragment weg
     parsed = parsed._replace(fragment="")
-    # Trailing slash normalisieren (Root-Slash bleibt)
     if parsed.path and parsed.path != "/" and parsed.path.endswith("/"):
         parsed = parsed._replace(path=parsed.path.rstrip("/"))
     rebuilt = urlunparse(parsed)
-    # w3lib übernimmt finale Kanonisierung (Sortierung, Encoding, Lowercase
-    # scheme/host, Prozent-Encoding).
     return canonicalize_url(rebuilt)
 
 
@@ -723,14 +586,14 @@ def normalize_url(url: str) -> str:
 
 
 class WaybackErrorPageException(Exception):
-    """Wirft, wenn Wayback eine der bekannten Fehlerseiten ausliefert."""
+    pass
+
+
+class CDXFetchError(Exception):
+    """Ein CDX-Request hat keine verwertbare Antwort geliefert."""
 
 
 def _should_retry(exc: BaseException) -> bool:
-    """Tenacity-Predicate: True, wenn Exception retryable ist.
-
-    Retryt bei Netz-Fehlern und bei 429/500/502/503/504. Kein Retry bei 404.
-    """
     if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
         return True
     if isinstance(exc, requests.exceptions.ChunkedEncodingError):
@@ -749,10 +612,7 @@ _retry_decorator = retry(
     retry=retry_if_exception(_should_retry),
 )
 
-# CDX-Queries gegen den Wayback-Server sind besonders fragil bei großen
-# Domains (aerzteblatt.de, bfarm.de, rki.de). Wayback antwortet dann mit 503/504
-# und braucht teils Minuten zur Erholung. Wir nutzen aggressivere Retries:
-# 8 Versuche statt 5, und Wartezeit bis zu 120s statt 32s.
+# Aggressivere Retries speziell für CDX: bis zu 8 Versuche, bis zu 120s Warten.
 _cdx_retry_decorator = retry(
     reraise=True,
     stop=stop_after_attempt(8),
@@ -762,22 +622,11 @@ _cdx_retry_decorator = retry(
 
 
 def _cdx_file_cache_path(cfg: Config, target: DomainTarget, years: range) -> Path:
-    """Pfad zum file-basierten CDX-Cache für ein Target + Jahresbereich.
-
-    Das JSON wird gzipped gespeichert, weil CDX-Responses für stark
-    archivierte Domains mehrere hundert MB bis GB erreichen können.
-    """
     years_key = f"{years[0]}-{years[-1]}"
     return cfg.cache_dir / "cdx" / f"{target.file_slug}__{years_key}.json.gz"
 
 
 def _read_cdx_file_cache(path: Path, ttl_seconds: int) -> Optional[list[CDXRow]]:
-    """Liest gecachte CDX-Rows, wenn die Datei jünger als ``ttl_seconds`` ist.
-
-    Returns:
-        Liste von ``CDXRow`` oder ``None``, wenn Cache nicht existiert, abgelaufen
-        oder defekt ist.
-    """
     if not path.exists():
         return None
     try:
@@ -785,9 +634,7 @@ def _read_cdx_file_cache(path: Path, ttl_seconds: int) -> Optional[list[CDXRow]]
     except OSError:
         return None
     if age > ttl_seconds:
-        logger.debug(
-            "CDX-Cache {} abgelaufen ({:.1f}d alt)", path.name, age / 86400.0
-        )
+        logger.debug("CDX-Cache {} abgelaufen ({:.1f}d alt)", path.name, age / 86400.0)
         return None
     try:
         with gzip.open(path, "rt", encoding="utf-8") as f:
@@ -799,7 +646,6 @@ def _read_cdx_file_cache(path: Path, ttl_seconds: int) -> Optional[list[CDXRow]]
 
 
 def _write_cdx_file_cache(path: Path, rows: list[CDXRow]) -> None:
-    """Schreibt CDX-Rows atomar als gzipped JSON."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     try:
@@ -814,16 +660,57 @@ def _write_cdx_file_cache(path: Path, rows: list[CDXRow]) -> None:
             pass
 
 
-class CDXFetchError(Exception):
-    """Ein CDX-Request hat keine verwertbare Antwort geliefert.
+def _parse_cdx_rows_from_data(data: list, label: str) -> tuple[list[CDXRow], Optional[str]]:
+    """Parst eine Liste von CDX-JSON-Zeilen.
 
-    Unterschieden von ``requests.HTTPError`` etc., damit der Aufrufer
-    gezielt auf Nicht-JSON / Empty-Response / Exception reagieren kann
-    (z.B. Jahr-für-Jahr-Fallback).
+    Der Wayback CDX-Server hängt bei paginierter Ausgabe eine letzte Zeile
+    mit dem resumeKey an — erkennbar daran, dass die Zeile nur ein Element
+    (den Key-String) enthält statt der üblichen 7 Felder.
+
+    Returns:
+        Tupel (rows, resume_key). resume_key ist None, wenn keine weiteren
+        Seiten existieren.
     """
+    if not data:
+        return [], None
+
+    # Erste Zeile ist immer der Header (fieldnames), überspringen.
+    rows_raw = data[1:]
+    resume_key: Optional[str] = None
+
+    # Letztes Element: resumeKey-Sentinel prüfen.
+    # Wayback liefert entweder ["resumeKey", "<value>"] (2-Element-Liste)
+    # oder direkt den Key als einfachen String — beides abfangen.
+    if rows_raw:
+        last = rows_raw[-1]
+        if isinstance(last, list) and len(last) == 1 and isinstance(last[0], str):
+            # Einzel-Element-Liste → resumeKey-Wert
+            resume_key = last[0]
+            rows_raw = rows_raw[:-1]
+        elif isinstance(last, list) and len(last) == 2 and last[0] == "resumeKey":
+            resume_key = str(last[1])
+            rows_raw = rows_raw[:-1]
+
+    out: list[CDXRow] = []
+    for row in rows_raw:
+        if not isinstance(row, list) or len(row) < 6:
+            continue
+        try:
+            out.append(CDXRow(
+                urlkey=str(row[0]),
+                timestamp=str(row[1]),
+                original=str(row[2]),
+                mimetype=str(row[3]),
+                statuscode=str(row[4]),
+                digest=str(row[5]),
+                length=str(row[6]) if len(row) > 6 else "",
+            ))
+        except (TypeError, ValueError):
+            continue
+    return out, resume_key
 
 
-def _fetch_cdx_single_query(
+def _fetch_cdx_paginated(
     cdx_url: str,
     match_type: str,
     from_ts: str,
@@ -831,133 +718,237 @@ def _fetch_cdx_single_query(
     session: requests.Session,
     rate_limit: float,
     label: str,
+    page_size: int = CDX_PAGE_SIZE,
+    collapse: Optional[str] = None,
 ) -> list[CDXRow]:
-    """Führt EINE einzelne CDX-Query aus. Wirft ``CDXFetchError`` bei Problemen.
+    """Holt CDX-Ergebnisse mit Paginierung via resumeKey.
+
+    Wayback gibt bei limit-basierten Queries am Ende jeder vollen Seite einen
+    resumeKey zurück. Diese Funktion iteriert automatisch alle Seiten.
 
     Args:
-        cdx_url: Der ``url``-Parameter für CDX (Host oder Host+Pfad).
+        cdx_url: Der ``url``-Parameter für CDX.
         match_type: ``"domain"`` oder ``"prefix"``.
         from_ts: Start-Timestamp (YYYYMMDD).
         to_ts: End-Timestamp (YYYYMMDD).
         session: Plain requests.Session.
         rate_limit: Rate-Limit in req/s.
-        label: Label nur fürs Logging (z.B. ``"bfarm.de [2018]"``).
+        label: Nur fürs Logging.
+        page_size: Zeilen pro Seite.
+        collapse: Optionales CDX ``collapse``-Feld, z.B. ``"timestamp:4"``.
 
     Returns:
-        Liste von CDXRow. Kann leer sein, wenn Wayback tatsächlich nichts hat.
+        Alle CDXRow über alle Seiten gesammelt.
 
     Raises:
-        CDXFetchError: Bei Non-JSON-Response, HTTP-Fehler nach Retry-Erschöpfung,
-            oder unerwarteter Response-Struktur.
+        CDXFetchError: Bei nicht behebbarem Fehler.
     """
-    params = [
-        ("url", cdx_url),
-        ("matchType", match_type),
-        ("from", from_ts),
-        ("to", to_ts),
-        ("filter", "statuscode:200"),
-        ("filter", "mimetype:text/html"),
-        ("output", "json"),
-    ]
+    all_rows: list[CDXRow] = []
+    resume_key: Optional[str] = None
+    page_num = 0
 
-    # Accept-Encoding: identity → kein gzip. Wayback's Gzip-Streaming bei
-    # großen Responses ist instabil und reißt mit ChunkedEncodingError ab.
-    # Ungepackt ist größer auf der Leitung, aber deutlich zuverlässiger.
-    request_headers = {"Accept-Encoding": "identity"}
-
-    @_cdx_retry_decorator
-    def _do_request_and_read() -> bytes:
-        """Feuert den Request UND liest den kompletten Body innerhalb des Retry-Scopes.
-
-        Der Body-Read muss hier passieren, weil ``ChunkedEncodingError`` erst
-        beim Streamen der Chunks auftritt — nicht beim initialen ``get()``.
-        Ohne Body-Read im Retry-Scope würde der Retry-Mechanismus nie greifen.
-        """
-        rate_limit_wait(rate_limit)
-        r = session.get(
-            CDX_ENDPOINT,
-            params=params,
-            headers=request_headers,
-            timeout=(30, 300),
-            stream=True,
-        )
-        if r.status_code in (429, 500, 502, 503, 504):
-            r.raise_for_status()
-        if r.status_code != 200:
-            # Andere Status-Codes NICHT retryen (z.B. 404); Caller entscheidet.
-            r.status_code_for_caller = r.status_code  # type: ignore[attr-defined]
-            return b""
-        # Kompletten Body in den Retry-Scope ziehen.
-        # iter_content ist robuster als .content bei großen Streams.
-        chunks: list[bytes] = []
-        try:
-            for chunk in r.iter_content(chunk_size=65536):
-                if chunk:
-                    chunks.append(chunk)
-        finally:
-            try:
-                r.close()
-            except Exception:  # noqa: BLE001
-                pass
-        return b"".join(chunks)
-
-    try:
-        body = _do_request_and_read()
-    except Exception as exc:  # noqa: BLE001
-        raise CDXFetchError(
-            f"Request für {label} fehlgeschlagen: {type(exc).__name__}: {exc}"
-        ) from exc
-
-    if not body:
-        # Entweder leerer Body (200 OK) oder Non-200-Status, der oben gesetzt
-        # wurde. Beides als "leere Response" behandeln.
-        return []
-
-    try:
-        data = json.loads(body.decode("utf-8", errors="replace"))
-    except (ValueError, UnicodeDecodeError) as exc:
-        # Preview der Response ins Log, damit man sieht was Wayback schickt
-        # (oft HTML-Fehlerseite bei überlasteten Queries, oder trunkiertes
-        # JSON bei serverseitig abgebrochenen Streams).
-        try:
-            preview = body[:500].decode("utf-8", errors="replace").replace("\n", " ")
-        except Exception:  # noqa: BLE001
-            preview = "<unreadable>"
-        raise CDXFetchError(
-            f"Response für {label} war kein gültiges JSON ({len(body)} bytes). "
-            f"Preview: {preview!r}"
-        ) from exc
-
-    if data is None:
-        return []
-    if not isinstance(data, list):
-        raise CDXFetchError(
-            f"Response für {label} war unerwartetes Format: {type(data).__name__}"
-        )
-    if not data:
-        return []
-
-    # Erste Zeile ist der Header, Rest sind Daten.
-    rows = data[1:]
-    out: list[CDXRow] = []
-    for row in rows:
-        if len(row) < 6:
-            continue
-        try:
-            out.append(
-                CDXRow(
-                    urlkey=str(row[0]),
-                    timestamp=str(row[1]),
-                    original=str(row[2]),
-                    mimetype=str(row[3]),
-                    statuscode=str(row[4]),
-                    digest=str(row[5]),
-                    length=str(row[6]) if len(row) > 6 else "",
-                )
+    while True:
+        if len(all_rows) >= CDX_MAX_TOTAL_ROWS:
+            logger.warning(
+                "CDX {} hat CDX_MAX_TOTAL_ROWS={} erreicht, breche ab.",
+                label, CDX_MAX_TOTAL_ROWS,
             )
-        except (TypeError, ValueError):
+            break
+
+        params: list[tuple[str, str]] = [
+            ("url", cdx_url),
+            ("matchType", match_type),
+            ("from", from_ts),
+            ("to", to_ts),
+            ("filter", "statuscode:200"),
+            ("filter", "mimetype:text/html"),
+            ("output", "json"),
+            ("limit", str(page_size)),
+        ]
+        if collapse:
+            params.append(("collapse", collapse))
+        if resume_key:
+            params.append(("resumeKey", resume_key))
+
+        # Closure über aktuelle params-Kopie, damit der Retry korrekt funktioniert.
+        current_params = list(params)
+
+        @_cdx_retry_decorator
+        def _do_page_request(p=current_params) -> bytes:
+            rate_limit_wait(rate_limit)
+            r = session.get(
+                CDX_ENDPOINT,
+                params=p,
+                headers={"Accept-Encoding": "identity"},
+                timeout=(30, 300),
+                stream=True,
+            )
+            if r.status_code in (429, 500, 502, 503, 504):
+                r.raise_for_status()
+            if r.status_code != 200:
+                return b""
+            chunks: list[bytes] = []
+            try:
+                for chunk in r.iter_content(chunk_size=65536):
+                    if chunk:
+                        chunks.append(chunk)
+            finally:
+                try:
+                    r.close()
+                except Exception:
+                    pass
+            return b"".join(chunks)
+
+        try:
+            body = _do_page_request()
+        except Exception as exc:
+            raise CDXFetchError(
+                f"Request für {label} Seite {page_num} fehlgeschlagen: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+        if not body:
+            # Leere Response = Ende der Daten oder Fehler.
+            logger.debug("CDX {} Seite {}: leere Response, stoppe Paginierung.", label, page_num)
+            break
+
+        try:
+            data = json.loads(body.decode("utf-8", errors="replace"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            try:
+                preview = body[:500].decode("utf-8", errors="replace").replace("\n", " ")
+            except Exception:
+                preview = "<unreadable>"
+            raise CDXFetchError(
+                f"Non-JSON-Response für {label} Seite {page_num} "
+                f"({len(body)} bytes). Preview: {preview!r}"
+            ) from exc
+
+        if not isinstance(data, list) or len(data) <= 1:
+            # Nur Header-Zeile oder leer → Ende.
+            logger.debug("CDX {} Seite {}: keine Datenzeilen, stoppe.", label, page_num)
+            break
+
+        page_rows, new_resume_key = _parse_cdx_rows_from_data(data, label)
+        all_rows.extend(page_rows)
+        page_num += 1
+
+        logger.debug(
+            "CDX {} Seite {}: {} Zeilen geladen (gesamt {}), resumeKey={}",
+            label, page_num, len(page_rows), len(all_rows),
+            "ja" if new_resume_key else "nein",
+        )
+
+        if new_resume_key is None:
+            # Letzte Seite erreicht.
+            break
+
+        resume_key = new_resume_key
+
+        # Kleines Extra-Delay zwischen Seiten: Wayback-Infrastruktur schonen.
+        # Bei großen Domains (aerzteblatt.de, bfarm.de) führt zu schnelles
+        # Paginieren zu 503-Kaskaden.
+        jitter = random.uniform(0.5, 1.5)
+        time.sleep(jitter)
+
+    return all_rows
+
+
+def _month_ranges_for_year(year: int) -> list[tuple[str, str]]:
+    """Gibt 12 (from_ts, to_ts)-Paare für alle Monate eines Jahres zurück."""
+    result: list[tuple[str, str]] = []
+    for month in range(1, 13):
+        last_day = calendar.monthrange(year, month)[1]
+        result.append((f"{year}{month:02d}01", f"{year}{month:02d}{last_day:02d}"))
+    return result
+
+
+def _fetch_cdx_range_with_fallbacks(
+    cdx_url: str,
+    match_type: str,
+    from_ts: str,
+    to_ts: str,
+    session: requests.Session,
+    rate_limit: float,
+    label: str,
+    depth: int = 0,
+    max_depth: int = 4,
+) -> tuple[list[CDXRow], bool]:
+    """Versucht CDX-Fetch für einen Zeitraum, splittet bei Bedarf rekursiv.
+
+    Fallback-Hierarchie bei Fehlschlag:
+        depth=0 → ganzen Zeitraum via Paginierung
+        depth=1 → Jahre
+        depth=2 → Halbjahre
+        depth=3 → Quartale
+        depth=4 → Monate (kein weiteres Splitting)
+
+    Returns:
+        Tupel (rows, ok). ok=False wenn ALLE Sub-Queries fehlschlagen.
+    """
+    # Versuche zunächst paginiert.
+    try:
+        rows = _fetch_cdx_paginated(
+            cdx_url, match_type, from_ts, to_ts,
+            session, rate_limit, label,
+        )
+        return rows, True
+    except CDXFetchError as exc:
+        if depth >= max_depth:
+            logger.warning(
+                "CDX {} [{}..{}] Tiefe {} erreicht, aufgegeben: {}",
+                label, from_ts, to_ts, depth, exc,
+            )
+            return [], False
+        logger.warning(
+            "CDX {} [{}..{}] Tiefe {}: Fehler ({}), versuche Split.",
+            label, from_ts, to_ts, depth, exc,
+        )
+
+    # Zeitraum in zwei Hälften teilen.
+    try:
+        start = datetime.strptime(from_ts[:8], "%Y%m%d")
+        end = datetime.strptime(to_ts[:8], "%Y%m%d")
+        mid = start + (end - start) / 2
+        mid_ts = mid.strftime("%Y%m%d")
+        # mid_ts darf nicht gleich from_ts oder to_ts sein.
+        if mid_ts <= from_ts or mid_ts >= to_ts:
+            # Zeitraum zu klein zum Splitten → aufgeben.
+            logger.warning(
+                "CDX {} [{}..{}]: Zeitraum zu klein für Split, aufgegeben.",
+                label, from_ts, to_ts,
+            )
+            return [], False
+    except ValueError:
+        return [], False
+
+    # Einen Tag vor mid als to_ts der ersten Hälfte berechnen.
+    mid_date = datetime.strptime(mid_ts, "%Y%m%d").date()
+    # erste Hälfte: from_ts .. mid_ts-1
+    prev_day = (mid_date.replace(day=mid_date.day) - 
+                __import__("datetime").timedelta(days=1))
+    first_to = prev_day.strftime("%Y%m%d")
+    second_from = mid_ts
+
+    combined: list[CDXRow] = []
+    any_ok = False
+
+    for (f, t), sub_label in [
+        ((from_ts, first_to), f"{label}[H1]"),
+        ((second_from, to_ts), f"{label}[H2]"),
+    ]:
+        if f > t:
             continue
-    return out
+        rows, ok = _fetch_cdx_range_with_fallbacks(
+            cdx_url, match_type, f, t,
+            session, rate_limit, sub_label,
+            depth=depth + 1, max_depth=max_depth,
+        )
+        combined.extend(rows)
+        if ok or rows:
+            any_ok = True
+
+    return combined, any_ok
 
 
 def fetch_cdx_index(
@@ -969,56 +960,45 @@ def fetch_cdx_index(
 ) -> list[CDXRow]:
     """Holt den CDX-Index für eine Domain über den angegebenen Jahresbereich.
 
-    Strategie:
+    Strategie (Robustheitsstufen):
 
     1. **File-Cache-Check** (7 Tage TTL). Bei Hit: zurück aus Cache.
-    2. **Ein großer Request** über den kompletten Jahresbereich. Klappt das →
-       Ergebnis cachen und zurückgeben.
-    3. **Fallback auf Jahr-für-Jahr-Queries**, wenn der große Request:
-       - Eine Exception/Nicht-JSON-Response lieferte ODER
-       - 0 Zeilen für einen Target lieferte, von dem wir mehr erwarten
-         (Heuristik: jedes Target, das nicht explizit limitiert wurde)
+    2. **Paginierte Gesamtquery** über kompletten Jahresbereich.
+       Klappt das → Ergebnis cachen und zurückgeben.
+    3. **Jahr-für-Jahr-Fallback** (paginiert), falls Gesamtquery leer oder
+       fehlerhaft. Pro Jahr ggf. Halbjahres- → Quartals- → Monats-Split.
+    4. **collapse=timestamp:4-Notfallmodus**: Falls selbst monatliche Queries
+       für manche Jahre fehlschlagen, wird eine sehr kompakte CDX-Query mit
+       ``collapse=timestamp:4`` versucht. Das liefert nur einen Eintrag pro
+       URL pro Jahr (den zeitlich ersten), verliert also Datums-Granularität,
+       ist aber extrem zuverlässig auch für stark archivierte Domains.
 
-    Hintergrund Fallback: stark archivierte Domains (bfarm.de, rki.de, etc.)
-    überlasten die CDX-Gesamt-Query, und Wayback liefert dann statt JSON eine
-    HTML-Fehlerseite oder `[]` zurück. Pro-Jahr-Queries sind viel kleiner und
-    gehen verlässlich durch.
-
-    Verhalten abhängig vom ``DomainTarget``:
-
-    - Ohne Pfad-Präfix (z.B. ``example.de``): ``matchType=domain`` → alle
-      Subdomains und Pfade.
-    - Mit Pfad-Präfix (z.B. ``siemens.com/de``): ``matchType=prefix`` mit
-      Trailing-Slash am Präfix → nur URLs unter diesem Pfad.
-
-    ``collapse=urlkey`` wird NICHT gesetzt, damit Multi-Edit-Szenarien (eine
-    URL mit mehreren ``dateModified``-Jahren) über mehrere Captures erkannt
-    werden können.
+    Paginierung: Alle CDX-Requests nutzen ``limit=CDX_PAGE_SIZE`` und
+    iterieren den von Wayback zurückgegebenen ``resumeKey`` bis zum Ende.
+    Damit werden auch Domains mit Millionen von archivierten URLs sauber
+    geladen, ohne dass ein einzelner Request die Server-Infrastruktur
+    überlastet.
 
     Args:
         target: Die zu crawlende Domain-Spezifikation.
-        session: Plain ``requests.Session`` (ohne requests-cache).
+        session: Plain ``requests.Session``.
         years: Jahresbereich als ``range``.
         rate_limit: Rate-Limit in Requests/s.
         cfg: Konfiguration (für Cache-Pfad).
 
     Returns:
-        Liste von ``CDXRow``-Instanzen. Leer, wenn Wayback tatsächlich nichts
-        hat.
+        Liste von ``CDXRow``-Instanzen. Leer, wenn Wayback tatsächlich nichts hat.
 
     Raises:
-        CDXFetchError: Wenn sowohl die Gesamtquery als auch ALLE
-            Jahr-für-Jahr-Queries fehlschlagen.
+        CDXFetchError: Wenn alle Strategien für alle Jahre fehlschlagen.
     """
-    # 1) File-Cache-Check (billig, umgeht Rate-Limit).
+    # 1) File-Cache-Check
     cache_path = _cdx_file_cache_path(cfg, target, years)
     cached = _read_cdx_file_cache(cache_path, CDX_CACHE_TTL_SECONDS)
     if cached is not None:
         logger.info(
             "CDX für {}: {} Zeilen aus File-Cache ({})",
-            target.raw,
-            len(cached),
-            cache_path.name,
+            target.raw, len(cached), cache_path.name,
         )
         return cached
 
@@ -1032,180 +1012,117 @@ def fetch_cdx_index(
     start_ts = f"{years[0]}0101"
     end_ts = f"{years[-1]}1231"
 
-    # 2) Große Gesamtquery versuchen.
+    # 2) Paginierte Gesamtquery
+    logger.info("CDX {} Gesamtquery (paginiert) [{}-{}] …", target.raw, years[0], years[-1])
     try:
-        rows = _fetch_cdx_single_query(
-            cdx_url,
-            match_type,
-            start_ts,
-            end_ts,
-            session,
-            rate_limit,
-            label=f"{target.raw} [{years[0]}-{years[-1]}]",
+        rows = _fetch_cdx_paginated(
+            cdx_url, match_type, start_ts, end_ts,
+            session, rate_limit,
+            label=f"{target.raw}[gesamt]",
         )
         if rows:
-            logger.info(
-                "CDX für {}: {} Rohzeilen (Gesamtquery)", target.raw, len(rows)
-            )
+            logger.info("CDX für {}: {} Rohzeilen (Gesamtquery)", target.raw, len(rows))
             _write_cdx_file_cache(cache_path, rows)
             return rows
-        # Leere Response: das KANN legitim sein (Wayback hat nichts), aber
-        # bei stark archivierten .de-Hosts deutet es meist auf einen stillen
-        # Query-Drop hin. Wir versuchen den Jahr-für-Jahr-Fallback.
         logger.warning(
-            "CDX-Gesamtquery für {} lieferte 0 Zeilen, "
-            "versuche Jahr-für-Jahr-Fallback",
+            "CDX-Gesamtquery für {} lieferte 0 Zeilen, versuche Jahr-für-Jahr.",
             target.raw,
         )
     except CDXFetchError as exc:
         logger.warning(
-            "CDX-Gesamtquery für {} fehlgeschlagen ({}), "
-            "versuche Jahr-für-Jahr-Fallback",
-            target.raw,
-            exc,
+            "CDX-Gesamtquery für {} fehlgeschlagen ({}), versuche Jahr-für-Jahr.",
+            target.raw, exc,
         )
 
-    # 3) Jahr-für-Jahr-Fallback.
+    # 3) Jahr-für-Jahr mit rekursivem Split (Halbjahr → Quartal → Monat)
     combined: list[CDXRow] = []
     years_ok = 0
     years_failed: list[int] = []
+
     for year in years:
-        try:
-            year_rows = _fetch_cdx_single_query(
-                cdx_url,
-                match_type,
-                f"{year}0101",
-                f"{year}1231",
-                session,
-                rate_limit,
-                label=f"{target.raw} [{year}]",
-            )
+        year_label = f"{target.raw}[{year}]"
+        logger.info("CDX {} Jahresquery {} (paginiert, bis Monat-Split) …", target.raw, year)
+        year_rows, ok = _fetch_cdx_range_with_fallbacks(
+            cdx_url, match_type,
+            f"{year}0101", f"{year}1231",
+            session, rate_limit,
+            label=year_label,
+            depth=0,
+            # depth=0: versucht Gesamtjahr
+            # depth=1: H1/H2
+            # depth=2: Quartale
+            # depth=3: Monate
+            # depth=4: Wochen (durch binären Split)
+            max_depth=4,
+        )
+        if ok or year_rows:
             combined.extend(year_rows)
             years_ok += 1
-            logger.debug(
-                "CDX {} Jahr {}: {} Zeilen", target.raw, year, len(year_rows)
+            logger.info(
+                "CDX {} Jahr {}: {} Zeilen (rekursiver Split erfolgreich)",
+                target.raw, year, len(year_rows),
             )
-        except CDXFetchError as exc:
-            # Sub-Fallback: das ganze Jahr in 2 Halbjahre splitten.
-            # Hilft bei sehr stark archivierten Domains, deren einzelne Jahre
-            # allein schon zu groß für Wayback sind (bfarm.de ab 2019 etc.).
-            # Bei Bedarf nochmal in Quartale splitten (aerzteblatt.de 2015+).
-            logger.warning(
-                "CDX-Jahresquery {} [{}] fehlgeschlagen ({}), "
-                "versuche Halbjahres-Fallback",
-                target.raw,
-                year,
-                exc,
-            )
-            year_combined_rows: list[CDXRow] = []
-            year_chunks_ok = 0
-            year_chunks_total = 0
-            # Quartale, die ein Halbjahr aufmachen, wenn das Halbjahr fehlschlägt:
-            quarters_in_half = {
-                f"{year}0101": [(f"{year}0101", f"{year}0331"),
-                                (f"{year}0401", f"{year}0630")],
-                f"{year}0701": [(f"{year}0701", f"{year}0930"),
-                                (f"{year}1001", f"{year}1231")],
-            }
-            for half_from, half_to in (
-                (f"{year}0101", f"{year}0630"),
-                (f"{year}0701", f"{year}1231"),
-            ):
-                try:
-                    year_chunks_total += 1
-                    hr = _fetch_cdx_single_query(
-                        cdx_url,
-                        match_type,
-                        half_from,
-                        half_to,
-                        session,
-                        rate_limit,
-                        label=f"{target.raw} [{half_from[:6]}]",
-                    )
-                    year_combined_rows.extend(hr)
-                    year_chunks_ok += 1
-                except CDXFetchError as half_exc:
-                    logger.warning(
-                        "CDX-Halbjahresquery {} [{}] fehlgeschlagen ({}), "
-                        "versuche Quartals-Fallback",
-                        target.raw,
-                        half_from[:6],
-                        half_exc,
-                    )
-                    # Quartals-Sub-Sub-Fallback: das Halbjahr in 2 Quartale splitten.
-                    quarters_ok_in_half = 0
-                    for q_from, q_to in quarters_in_half[half_from]:
-                        try:
-                            year_chunks_total += 1
-                            qr = _fetch_cdx_single_query(
-                                cdx_url,
-                                match_type,
-                                q_from,
-                                q_to,
-                                session,
-                                rate_limit,
-                                label=f"{target.raw} [{q_from[:6]}]",
-                            )
-                            year_combined_rows.extend(qr)
-                            year_chunks_ok += 1
-                            quarters_ok_in_half += 1
-                        except CDXFetchError as quarter_exc:
-                            logger.warning(
-                                "CDX-Quartalsquery {} [{}] fehlgeschlagen: {}",
-                                target.raw,
-                                q_from[:6],
-                                quarter_exc,
-                            )
-                            continue
-                    if quarters_ok_in_half > 0:
-                        logger.info(
-                            "CDX {} Halbjahr {} via Quartals-Fallback gerettet "
-                            "({}/2 Quartale)",
-                            target.raw,
-                            half_from[:6],
-                            quarters_ok_in_half,
-                        )
-                    continue
-            if year_chunks_ok > 0:
-                combined.extend(year_combined_rows)
-                years_ok += 1
-                logger.info(
-                    "CDX {} Jahr {} via Sub-Fallback: {} Zeilen "
-                    "({}/{} Sub-Queries ok)",
-                    target.raw,
-                    year,
-                    len(year_combined_rows),
-                    year_chunks_ok,
-                    year_chunks_total,
+        else:
+            logger.warning("CDX {} Jahr {}: ALLE Sub-Queries fehlgeschlagen.", target.raw, year)
+            years_failed.append(year)
+
+    # 4) Notfallmodus: collapse=timestamp:4 für fehlgeschlagene Jahre
+    #    Dieser Modus liefert nur einen Capture pro URL pro Jahr (den ersten),
+    #    was die Datums-Granularität leicht einschränkt, aber extrem
+    #    zuverlässig ist. Die Qualität des Outputs bleibt hoch, weil der
+    #    downstream-Code in group_captures_by_url_and_year die beste
+    #    Annäherung an Mitte-Jahr wählt — hier gibt es zwar nur eine Option,
+    #    aber es ist besser als gar keine Daten.
+    if years_failed:
+        logger.info(
+            "CDX {} Notfallmodus (collapse=timestamp:4) für {} fehlgeschlagene Jahre: {}",
+            target.raw, len(years_failed), years_failed,
+        )
+        for year in years_failed:
+            collapse_label = f"{target.raw}[{year}:collapse]"
+            try:
+                collapse_rows = _fetch_cdx_paginated(
+                    cdx_url, match_type,
+                    f"{year}0101", f"{year}1231",
+                    session, rate_limit,
+                    label=collapse_label,
+                    collapse="timestamp:4",
                 )
-            else:
-                years_failed.append(year)
-            continue
+                if collapse_rows:
+                    combined.extend(collapse_rows)
+                    years_ok += 1
+                    years_failed.remove(year)
+                    logger.info(
+                        "CDX {} Jahr {} via collapse-Notfallmodus: {} Zeilen",
+                        target.raw, year, len(collapse_rows),
+                    )
+                else:
+                    logger.warning(
+                        "CDX {} Jahr {} collapse-Notfallmodus lieferte 0 Zeilen.",
+                        target.raw, year,
+                    )
+            except CDXFetchError as exc:
+                logger.error(
+                    "CDX {} Jahr {} collapse-Notfallmodus fehlgeschlagen: {}",
+                    target.raw, year, exc,
+                )
 
     logger.info(
-        "CDX für {}: {} Rohzeilen (Fallback: {}/{} Jahre ok, {} fehlgeschlagen)",
-        target.raw,
-        len(combined),
-        years_ok,
-        len(list(years)),
-        len(years_failed),
+        "CDX für {}: {} Rohzeilen (Jahr-für-Jahr: {}/{} Jahre ok, {} endgültig fehlgeschlagen)",
+        target.raw, len(combined), years_ok, len(list(years)), len(years_failed),
     )
 
-    if years_ok == 0:
+    if years_ok == 0 and not combined:
         raise CDXFetchError(
-            f"Alle {len(list(years))} Jahr-für-Jahr-Queries für {target.raw} fehlgeschlagen"
+            f"Alle CDX-Strategien für {target.raw} fehlgeschlagen "
+            f"({len(list(years))} Jahre, inkl. collapse-Notfallmodus)"
         )
 
-    # Auch teilweise erfolgreichen Cache schreiben (besser als nichts beim
-    # nächsten Lauf). Wenn >50% der Jahre failed → nicht cachen, damit der
-    # nächste Lauf es nochmal versucht.
+    # Cache schreiben, wenn nicht zu unvollständig.
     if years_failed and len(years_failed) > len(list(years)) / 2:
         logger.warning(
-            "CDX-Ergebnis für {} unvollständig ({}/{} Jahre), "
-            "wird NICHT gecacht",
-            target.raw,
-            years_ok,
-            len(list(years)),
+            "CDX-Ergebnis für {} unvollständig ({}/{} Jahre), wird NICHT gecacht.",
+            target.raw, years_ok, len(list(years)),
         )
     elif combined:
         _write_cdx_file_cache(cache_path, combined)
@@ -1217,21 +1134,10 @@ def fetch_cdx_index(
 
 
 def pick_closest_to_july2(captures: list[CDXRow], year: int) -> CDXRow:
-    """Wählt den Capture, dessen Datum am nächsten zum 2. Juli des Jahres liegt.
-
-    Args:
-        captures: Liste von CDX-Captures (nicht leer).
-        year: Zieljahr.
-
-    Returns:
-        Der Capture mit minimaler absoluter Tagesdistanz. Tie-Break: früherer
-        Snapshot gewinnt.
-    """
     target = date(year, 7, 2)
 
     def _key(row: CDXRow) -> tuple[int, str]:
         delta = abs((row.capture_date - target).days)
-        # Tie-Break: früherer timestamp (= lexikalisch kleiner bei festem Format)
         return (delta, row.timestamp)
 
     return min(captures, key=_key)
@@ -1240,25 +1146,7 @@ def pick_closest_to_july2(captures: list[CDXRow], year: int) -> CDXRow:
 def group_captures_by_url_and_year(
     rows: list[CDXRow], years: range, target: DomainTarget
 ) -> dict[str, dict[int, CDXRow]]:
-    """Gruppiert CDX-Captures nach normalisierter URL und Jahr.
-
-    Pro (URL, Jahr) wird genau ein Capture gewählt: der mit der geringsten
-    Distanz zum 2. Juli des Jahres.
-
-    URLs werden zusätzlich gegen das ``DomainTarget`` validiert — ohne
-    Pfad-Präfix gilt nur Host/Subdomain-Gleichheit, mit Pfad-Präfix muss der
-    URL-Pfad mit dem Präfix beginnen.
-
-    Args:
-        rows: Rohzeilen aus dem CDX-Index.
-        years: Gültiger Jahresbereich; Captures außerhalb werden verworfen.
-        target: Domain-Spezifikation.
-
-    Returns:
-        Dict normalized_url -> dict year -> CDXRow.
-    """
     year_set = set(years)
-    # Erst alle Captures pro (normalized_url, year) sammeln.
     bucket: dict[str, dict[int, list[CDXRow]]] = {}
     for row in rows:
         try:
@@ -1267,7 +1155,6 @@ def group_captures_by_url_and_year(
             continue
         if year not in year_set:
             continue
-
         orig = row.original
         parsed = urlparse(orig)
         if parsed.scheme not in ("http", "https"):
@@ -1276,21 +1163,14 @@ def group_captures_by_url_and_year(
             continue
         if not _url_matches_target(orig, target):
             continue
-
         try:
             norm = normalize_url(orig)
-        except Exception:  # noqa: BLE001
+        except Exception:
             continue
-
-        # Sicherheits-Recheck nach Normalisierung: bei matchType=domain kann
-        # CDX URLs auf anderen Subdomains liefern, bei matchType=prefix kann
-        # die Normalisierung den Pfad in Edge-Cases modifizieren.
         if not _url_matches_target(norm, target):
             continue
-
         bucket.setdefault(norm, {}).setdefault(year, []).append(row)
 
-    # Pro (URL, Jahr) den besten Capture wählen.
     result: dict[str, dict[int, CDXRow]] = {}
     for url, year_map in bucket.items():
         per_year: dict[int, CDXRow] = {}
@@ -1305,19 +1185,7 @@ def sample_urls_per_year(
     limit_per_year: int,
     seed: int,
 ) -> list[tuple[str, int, CDXRow]]:
-    """Sampelt URLs pro Jahr unabhängig, max. ``limit_per_year`` pro Jahr.
-
-    Args:
-        url_year_map: Ergebnis von ``group_captures_by_url_and_year``.
-        limit_per_year: Maximum URLs pro Jahr.
-        seed: Seed für die lokale ``random.Random``-Instanz.
-
-    Returns:
-        Liste von (normalized_url, year, CDXRow), deterministisch sortiert.
-    """
     rng = random.Random(seed)
-
-    # Invertiere: year -> list of (url, row)
     per_year: dict[int, list[tuple[str, CDXRow]]] = {}
     for url, year_map in url_year_map.items():
         for year, row in year_map.items():
@@ -1326,11 +1194,10 @@ def sample_urls_per_year(
     out: list[tuple[str, int, CDXRow]] = []
     for year in sorted(per_year.keys()):
         bucket = per_year[year]
-        # Stabile Vor-Sortierung, damit Sampling deterministisch ist.
         bucket.sort(key=lambda x: x[0])
         if len(bucket) > limit_per_year:
             chosen = rng.sample(bucket, limit_per_year)
-            chosen.sort(key=lambda x: x[0])  # stabile Ausgabe
+            chosen.sort(key=lambda x: x[0])
         else:
             chosen = bucket
         for url, row in chosen:
@@ -1342,14 +1209,6 @@ def sample_urls_per_year(
 
 
 def is_valid_wayback_response(html: str) -> bool:
-    """Prüft, ob der Response-Body eine echte Seite und keine Wayback-Fehlerseite ist.
-
-    Args:
-        html: Rohes Response-Textfeld.
-
-    Returns:
-        True, wenn die Response als valide Seite gewertet wird.
-    """
     if not html:
         return False
     if len(html.encode("utf-8", errors="ignore")) < MIN_VALID_BODY_BYTES:
@@ -1367,22 +1226,6 @@ def fetch_snapshot(
     session: CachedSession,
     rate_limit: float,
 ) -> Optional[tuple[str, dict[str, str]]]:
-    """Lädt den Snapshot-HTML einer URL aus der Wayback Machine.
-
-    Nutzt das ``id_``-Flag, um die Wayback-Toolbar aus dem HTML zu entfernen.
-
-    Args:
-        timestamp: Wayback-Timestamp (YYYYMMDDHHMMSS).
-        url: Original-URL.
-        session: Cached Requests-Session.
-        rate_limit: Rate-Limit in Requests/s. Cache-Hits umgehen das Limit.
-
-    Returns:
-        Tupel (html, headers_dict) oder None bei 404 oder erkannter Fehlerseite.
-
-    Raises:
-        requests.HTTPError: Bei anderen HTTP-Fehlern nach Retry-Erschöpfung.
-    """
     fetch_url = SNAPSHOT_TEMPLATE.format(timestamp=timestamp, url=url)
 
     @_retry_decorator
@@ -1394,7 +1237,7 @@ def fetch_snapshot(
                 prepared = requests.Request("GET", fetch_url).prepare()
                 cache_key = session.cache.create_key(prepared)  # type: ignore[attr-defined]
                 cache_hit = session.cache.contains(key=cache_key)  # type: ignore[attr-defined]
-            except Exception:  # noqa: BLE001
+            except Exception:
                 cache_hit = False
         if not cache_hit:
             rate_limit_wait(rate_limit)
@@ -1408,9 +1251,7 @@ def fetch_snapshot(
     if resp.status_code == 404:
         return None
     if resp.status_code != 200:
-        logger.warning(
-            "Snapshot {} lieferte Status {}", fetch_url, resp.status_code
-        )
+        logger.warning("Snapshot {} lieferte Status {}", fetch_url, resp.status_code)
         return None
 
     html = resp.text
@@ -1425,23 +1266,15 @@ def fetch_snapshot(
 
 
 def _normalize_body(body: str) -> tuple[str, bool]:
-    """Bereinigt einen Body: NFKC, Whitespace, Trimming, Längen-Cap.
-
-    Returns:
-        Tupel (cleaned_body, truncated).
-    """
     if not body:
         return "", False
     nb = unicodedata.normalize("NFKC", body)
-    # Whitespace: beliebige Whitespace-Sequenzen zu einfachem Leerzeichen,
-    # Absätze (doppelte Newlines) behalten wir grob über eine zweistufige Regex.
     nb = re.sub(r"[ \t]+", " ", nb)
     nb = re.sub(r"\n{3,}", "\n\n", nb)
     nb = re.sub(r" *\n *", "\n", nb)
     nb = nb.strip()
     truncated = False
     if len(nb) > BODY_MAX_CHARS:
-        # Am nächsten Wortgrenze schneiden.
         cut = nb.rfind(" ", 0, BODY_MAX_CHARS)
         if cut < BODY_MAX_CHARS // 2:
             cut = BODY_MAX_CHARS
@@ -1451,17 +1284,6 @@ def _normalize_body(body: str) -> tuple[str, bool]:
 
 
 def extract_text(html: str) -> Optional[str]:
-    """Extrahiert den Haupttext einer HTML-Seite.
-
-    Zuerst ``trafilatura``, bei ``None`` Fallback auf BeautifulSoup
-    (``<article>`` bevorzugt, sonst ``<main>``, sonst ``<body>``).
-
-    Args:
-        html: Der HTML-Quelltext.
-
-    Returns:
-        Extrahierter Body oder ``None``, wenn nichts Sinnvolles gefunden wurde.
-    """
     try:
         body = trafilatura.extract(
             html,
@@ -1470,21 +1292,19 @@ def extract_text(html: str) -> Optional[str]:
             favor_precision=True,
             deduplicate=True,
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.debug("trafilatura.extract warf Exception: {}", exc)
         body = None
     if body and body.strip():
         return body
 
-    # Fallback: BeautifulSoup
     try:
         soup = BeautifulSoup(html, "lxml")
-    except Exception:  # noqa: BLE001
+    except Exception:
         try:
             soup = BeautifulSoup(html, "html.parser")
         except Exception:
             return None
-    # Script/Style entfernen
     for tag in soup(["script", "style", "noscript", "nav", "header", "footer", "aside"]):
         tag.decompose()
     container = soup.find("article") or soup.find("main") or soup.find("body")
@@ -1495,11 +1315,9 @@ def extract_text(html: str) -> Optional[str]:
 
 
 def _iter_jsonld_dicts(soup: BeautifulSoup):
-    """Iteriert über alle JSON-LD-Objekte (inkl. @graph und Listen)."""
     for script in soup.find_all("script", type="application/ld+json"):
         raw = script.string
         if not raw:
-            # manche CMSe schreiben mehrere Kinder
             raw = script.get_text() or ""
         raw = raw.strip()
         if not raw:
@@ -1507,7 +1325,6 @@ def _iter_jsonld_dicts(soup: BeautifulSoup):
         try:
             data = json.loads(raw)
         except (json.JSONDecodeError, ValueError):
-            # Teils mit HTML-Kommentaren umgeben.
             try:
                 cleaned = re.sub(r"^<!--|-->$", "", raw).strip()
                 data = json.loads(cleaned)
@@ -1534,26 +1351,15 @@ def _matches_article_type(obj: dict) -> bool:
 
 
 def extract_metadata(html: str) -> dict[str, str]:
-    """Extrahiert relevante Metadaten aus HTML (JSON-LD + meta-Tags).
-
-    Args:
-        html: Der HTML-Quelltext.
-
-    Returns:
-        Dict mit möglichen Keys: ``jsonld_datePublished``, ``jsonld_dateModified``,
-        ``meta_article_published_time``, ``meta_article_modified_time``,
-        ``meta_pubdate``, ``meta_last_modified``, ``time_tag``, ``trafilatura``.
-    """
     out: dict[str, str] = {}
     try:
         soup = BeautifulSoup(html, "lxml")
-    except Exception:  # noqa: BLE001
+    except Exception:
         try:
             soup = BeautifulSoup(html, "html.parser")
         except Exception:
             return out
 
-    # JSON-LD
     for obj in _iter_jsonld_dicts(soup):
         if not _matches_article_type(obj):
             continue
@@ -1562,7 +1368,6 @@ def extract_metadata(html: str) -> dict[str, str]:
         if "jsonld_dateModified" not in out and obj.get("dateModified"):
             out["jsonld_dateModified"] = str(obj["dateModified"])
 
-    # Meta-Tags
     def _meta(attrs: dict) -> Optional[str]:
         tag = soup.find("meta", attrs=attrs)
         if tag and tag.get("content"):
@@ -1576,7 +1381,6 @@ def extract_metadata(html: str) -> dict[str, str]:
     if mm:
         out["meta_article_modified_time"] = mm
 
-    # Varianten mit name=...
     for name in ("pubdate", "publishdate", "date", "DC.date.issued"):
         v = _meta({"name": re.compile(rf"^{re.escape(name)}$", re.IGNORECASE)})
         if v:
@@ -1587,7 +1391,6 @@ def extract_metadata(html: str) -> dict[str, str]:
     if lm:
         out["meta_last_modified"] = lm
 
-    # trafilatura metadata
     if _trafi_extract_metadata is not None:
         try:
             meta_obj = _trafi_extract_metadata(html)
@@ -1597,10 +1400,9 @@ def extract_metadata(html: str) -> dict[str, str]:
                     md = meta_obj.get("date")
                 if md:
                     out["trafilatura"] = str(md)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.debug("trafilatura metadata extract failed: {}", exc)
 
-    # Erstes <time datetime> im Artikel-Hauptbereich
     container = soup.find("article") or soup.find("main") or soup
     t = container.find("time") if container else None
     if t and t.get("datetime"):
@@ -1613,20 +1415,11 @@ def extract_metadata(html: str) -> dict[str, str]:
 
 
 _DATE_PATTERNS = [
-    # ISO 8601 volle Form
-    (
-        re.compile(r"^(\d{4})-(\d{2})-(\d{2})(?:[T ].*)?$"),
-        "day",
-    ),
-    # YYYY/MM/DD
+    (re.compile(r"^(\d{4})-(\d{2})-(\d{2})(?:[T ].*)?$"), "day"),
     (re.compile(r"^(\d{4})/(\d{2})/(\d{2})"), "day"),
-    # DD.MM.YYYY (deutsch)
     (re.compile(r"^(\d{2})\.(\d{2})\.(\d{4})"), "day_de"),
-    # YYYY-MM
     (re.compile(r"^(\d{4})-(\d{2})$"), "month"),
-    # YYYY
     (re.compile(r"^(\d{4})$"), "year"),
-    # RFC 1123 (HTTP Last-Modified): Thu, 01 Jan 2015 12:00:00 GMT
     (
         re.compile(
             r"^[A-Za-z]{3},\s+(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})", re.IGNORECASE
@@ -1641,15 +1434,7 @@ _RFC_MONTHS = {
 }
 
 
-def _parse_date_string(
-    raw: str,
-) -> Optional[tuple[date, str]]:
-    """Versucht, einen String in ein ``date`` + Präzision zu parsen.
-
-    Returns:
-        Tupel (date, "day"|"month"|"year") oder None bei Fehlschlag.
-        Monats/Jahr-Präzisionen werden aufgefüllt (Tag=1, Monat=1).
-    """
+def _parse_date_string(raw: str) -> Optional[tuple[date, str]]:
     if not raw:
         return None
     s = raw.strip()
@@ -1675,10 +1460,8 @@ def _parse_date_string(
                 return date(year, mon, day), "day"
         except (ValueError, IndexError):
             continue
-    # Fallback: datetime.fromisoformat mit Abschneiden
     try:
         core = s
-        # manche Feeds liefern +0200 ohne Doppelpunkt -> fromisoformat ab 3.11 schluckt das nicht
         if len(core) >= 10:
             d = datetime.fromisoformat(core[:10])
             return d.date(), "day"
@@ -1690,17 +1473,6 @@ def _parse_date_string(
 def resolve_publication_date(
     meta: dict[str, str], headers: dict[str, str]
 ) -> Optional[tuple[date, str, str]]:
-    """Bestimmt das finale Content-Datum gemäß Spec (Published + Modified).
-
-    Args:
-        meta: Metadaten-Dict aus ``extract_metadata``.
-        headers: HTTP-Header der Wayback-Response.
-
-    Returns:
-        Tupel (date, precision, source_label) oder ``None``, wenn weder
-        Published noch Modified extrahiert werden konnte.
-    """
-    # Reihenfolgen genau gemäß Spec.
     published_candidates = [
         ("jsonld_datePublished", meta.get("jsonld_datePublished")),
         ("meta_article_published_time", meta.get("meta_article_published_time")),
@@ -1714,8 +1486,7 @@ def resolve_publication_date(
         ("meta_last_modified", meta.get("meta_last_modified")),
         (
             "http_last_modified",
-            headers.get("Last-Modified")
-            or headers.get("X-Archive-Orig-Last-Modified"),
+            headers.get("Last-Modified") or headers.get("X-Archive-Orig-Last-Modified"),
         ),
     ]
 
@@ -1739,7 +1510,6 @@ def resolve_publication_date(
 
     if not published and not modified:
         return None
-
     if published and modified:
         if modified[0] > published[0]:
             return modified
@@ -1753,55 +1523,17 @@ def resolve_publication_date(
 
 
 def detect_language_safe(body: str, url: str) -> str:
-    """Erkennt die Sprache eines Textes robust und konservativ.
-
-    Regeln (strikt deutsch):
-
-    - ``len(body) >= 200``: ``langdetect.detect`` wird aufgerufen. Gibt den
-      erkannten Code zurück (``"de"`` oder andere). Bei
-      ``LangDetectException``: ``"lang_error"``.
-    - ``len(body) < 200``: langdetect ist bei kurzen Texten unzuverlässig
-      (würfelt). Wir vergeben ``"de_assumed"`` NUR, wenn der Text entweder
-      (a) auf einem Host mit ``.de``-TLD liegt, ODER
-      (b) auf einem Pfad mit eindeutigem DE-Marker (``/de``, ``/de-de``,
-      ``/germany``, ``/deutschland`` …). Sonst ``"too_short_unknown"``.
-
-    Diese zweite Regel ist strenger als der ursprüngliche Spec-Wortlaut, weil
-    die Input-Excel nun multinationale Domains mit deutschem Länderpfad
-    enthält — ein .com-Host liefert auch auf ``/en/``-Pfaden kurze Seiten, die
-    nicht automatisch deutsch sind.
-
-    Args:
-        body: Der normalisierte Body.
-        url: Die Quell-URL (für die Pfad-/TLD-Heuristik).
-
-    Returns:
-        ``"de"`` — langdetect hat Deutsch bestätigt.
-        ``"de_assumed"`` — kurzer Text, aber Host/Pfad deutet auf Deutsch.
-        ``"too_short_unknown"`` — kurzer Text ohne DE-Indikator → zu verwerfen.
-        ``"lang_error"`` — langdetect hat eine Exception geworfen.
-        anderer ISO-Code (``"en"``, ``"fr"`` …) — nicht deutsch, zu verwerfen.
-    """
     if len(body) >= 200:
         try:
             return detect(body)
         except LangDetectException:
             return "lang_error"
-    # Kurzer Text: nur behalten, wenn Host/Pfad deutsch.
     if _host_has_de_tld(url) or _url_has_german_marker(url):
         return "de_assumed"
     return "too_short_unknown"
 
 
 def find_ai_keywords(body: str) -> list[str]:
-    """Findet alle getroffenen AI-Keyword-Gruppen im Body.
-
-    Args:
-        body: Normalisierter Body.
-
-    Returns:
-        Liste von Keys aus ``AI_KEYWORDS``, in Definitionsreihenfolge.
-    """
     hits: list[str] = []
     for key, pattern in AI_KEYWORDS.items():
         if pattern.search(body):
@@ -1810,14 +1542,6 @@ def find_ai_keywords(body: str) -> list[str]:
 
 
 def find_health_keywords(body: str) -> list[str]:
-    """Findet alle getroffenen Health-Keyword-Gruppen im Body.
-
-    Args:
-        body: Normalisierter Body.
-
-    Returns:
-        Liste von Keys aus ``HEALTH_KEYWORDS``, in Definitionsreihenfolge.
-    """
     hits: list[str] = []
     for key, pattern in HEALTH_KEYWORDS.items():
         if pattern.search(body):
@@ -1825,10 +1549,8 @@ def find_health_keywords(body: str) -> list[str]:
     return hits
 
 
-# Rückwärtskompatibilität: einige ältere Aufrufer nutzen noch find_keywords.
-# Delegiert an find_ai_keywords.
 def find_keywords(body: str) -> list[str]:
-    """Deprecated: nutze ``find_ai_keywords``."""
+    """Deprecated: nutze find_ai_keywords."""
     return find_ai_keywords(body)
 
 
@@ -1872,19 +1594,6 @@ def load_or_fetch_parsed(
     session: CachedSession,
     cfg: Config,
 ) -> Optional[ParsedRecord]:
-    """Lädt einen geparsten Snapshot aus dem Cache oder fetcht und parst ihn.
-
-    Args:
-        url: Normalisierte Original-URL.
-        timestamp: Wayback-Timestamp.
-        session: Cached Requests-Session für HTML.
-        cfg: Laufzeit-Konfiguration.
-
-    Returns:
-        ``ParsedRecord`` bei Erfolg oder mit ``parse_success=False`` im
-        Fehlerfall (gecacht, damit Re-Runs nicht erneut fetchen). ``None`` nur
-        bei harten Netz-Fehlern, die nicht gecacht werden sollen.
-    """
     cached = _read_parsed_cache(cfg, url, timestamp)
     if cached is not None:
         return cached
@@ -1896,7 +1605,7 @@ def load_or_fetch_parsed(
     except RetryError as exc:
         logger.warning("Retries erschöpft für {}: {}", wb_url, exc)
         return None
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("Fetch-Fehler für {}: {}", wb_url, exc)
         return None
 
@@ -1909,14 +1618,13 @@ def load_or_fetch_parsed(
             skip_reason="wayback_404_or_error_page",
         )
         _write_parsed_cache(cfg, record)
-        # HTML-Cache-Eintrag löschen (falls aus requests-cache)
         _delete_http_cache_entry(session, wb_url)
         return record
 
     html, headers = fetched
     try:
         raw_body = extract_text(html)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("Textextraktion warf Exception für {}: {}", wb_url, exc)
         raw_body = None
 
@@ -1933,10 +1641,9 @@ def load_or_fetch_parsed(
         return record
 
     body, truncated = _normalize_body(raw_body)
-
-    # Metadaten & Datum
     meta = extract_metadata(html)
     date_info = resolve_publication_date(meta, headers)
+
     if date_info is None:
         record = ParsedRecord(
             url=url,
@@ -1946,8 +1653,9 @@ def load_or_fetch_parsed(
             skip_reason="no_date",
             body=body,
             body_truncated=truncated,
-            http_last_modified=headers.get("Last-Modified")
-            or headers.get("X-Archive-Orig-Last-Modified"),
+            http_last_modified=(
+                headers.get("Last-Modified") or headers.get("X-Archive-Orig-Last-Modified")
+            ),
         )
         _write_parsed_cache(cfg, record)
         _delete_http_cache_entry(session, wb_url)
@@ -1967,8 +1675,9 @@ def load_or_fetch_parsed(
         date_precision=precision,
         date_source=source,
         language=language,
-        http_last_modified=headers.get("Last-Modified")
-        or headers.get("X-Archive-Orig-Last-Modified"),
+        http_last_modified=(
+            headers.get("Last-Modified") or headers.get("X-Archive-Orig-Last-Modified")
+        ),
     )
     _write_parsed_cache(cfg, record)
     _delete_http_cache_entry(session, wb_url)
@@ -1976,36 +1685,26 @@ def load_or_fetch_parsed(
 
 
 def _delete_http_cache_entry(session: CachedSession, url: str) -> None:
-    """Löscht einen Eintrag aus dem requests-cache (HTML-Cache).
-
-    Die Delete-API von ``requests-cache`` hat sich zwischen Versionen
-    geändert. Diese Funktion probiert beide bekannten Signaturen.
-    """
     cache = getattr(session, "cache", None)
     if cache is None:
         return
-    # 1.x API: session.cache.delete(urls=[...])
     try:
         cache.delete(urls=[url])
         return
     except TypeError:
         pass
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.debug("HTML-Cache-Delete (1.x) fehlgeschlagen für {}: {}", url, exc)
-    # 0.x API: session.cache.delete_url(url)
     delete_url = getattr(cache, "delete_url", None)
     if callable(delete_url):
         try:
             delete_url(url)
             return
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "HTML-Cache-Delete (0.x) fehlgeschlagen für {}: {}", url, exc
-            )
-    # 1.x API Alt-Form: session.cache.delete(url)
+        except Exception as exc:
+            logger.debug("HTML-Cache-Delete (0.x) fehlgeschlagen für {}: {}", url, exc)
     try:
         cache.delete(url)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.debug("HTML-Cache-Delete (Fallback) fehlgeschlagen für {}: {}", url, exc)
 
 
@@ -2018,19 +1717,6 @@ def build_output_record(
     ai_tags: list[str],
     health_tags: list[str],
 ) -> dict:
-    """Baut das finale Output-Dict in der vorgegebenen Key-Reihenfolge.
-
-    Args:
-        parsed: Erfolgreicher ParsedRecord.
-        domain: Quelldomain.
-        ai_tags: Liste der gematchten AI-Keyword-Keys.
-        health_tags: Liste der gematchten Health-Keyword-Keys.
-
-    Returns:
-        Dict mit allen Feldern gemäß Output-Schema. Das Feld ``tags`` enthält
-        die vereinigte AI+Health-Liste (Rückwärtskompatibilität); zusätzlich
-        gibt es die getrennten Felder ``ai_tags`` und ``health_tags``.
-    """
     assert parsed.parse_success and parsed.body is not None and parsed.date_iso
     hash_input = f"{parsed.url}|{parsed.date_iso}".encode("utf-8")
     rec_id = hashlib.sha1(hash_input).hexdigest()[:16]
@@ -2056,7 +1742,6 @@ def build_output_record(
 
 
 def load_progress(cfg: Config) -> dict:
-    """Lädt ``state/progress.json`` (oder liefert leeres Dict)."""
     if not cfg.progress_path.exists():
         return {}
     try:
@@ -2068,7 +1753,6 @@ def load_progress(cfg: Config) -> dict:
 
 
 def save_progress(cfg: Config, progress: dict) -> None:
-    """Schreibt ``state/progress.json`` atomar."""
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     tmp = cfg.progress_path.with_suffix(".json.tmp")
     with tmp.open("w", encoding="utf-8") as f:
@@ -2085,7 +1769,6 @@ def update_domain_progress(
     last_url: Optional[str] = None,
     error: Optional[str] = None,
 ) -> None:
-    """Aktualisiert den Eintrag für eine Domain in progress.json."""
     entry = progress.setdefault(domain, {})
     entry["status"] = status
     entry["urls_total"] = stats.urls_total
@@ -2102,25 +1785,13 @@ def update_domain_progress(
 
 
 def finalize_domain_output(cfg: Config, target: DomainTarget) -> int:
-    """Mergt ``state/<slug>.partial.jsonl`` nach ``output/<slug>.jsonl``.
-
-    Args:
-        cfg: Konfiguration.
-        target: Domain-Spezifikation.
-
-    Returns:
-        Zahl der Zeilen im Output.
-    """
     partial = cfg.state_dir / f"{target.file_slug}.partial.jsonl"
     final = cfg.output_dir / f"{target.file_slug}.jsonl"
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     if not partial.exists():
-        # Kein Match gefunden: leere Output-Datei anlegen zur Markierung.
         final.touch()
         return 0
-    # Atomar verschieben.
     os.replace(partial, final)
-    # Zeilen zählen.
     count = 0
     with final.open("r", encoding="utf-8") as f:
         for _ in f:
@@ -2132,25 +1803,17 @@ def finalize_domain_output(cfg: Config, target: DomainTarget) -> int:
 
 
 def _make_cdx_session(cfg: Config) -> requests.Session:
-    """Baut eine plain ``requests.Session`` für CDX-Requests.
-
-    CDX nutzt bewusst keinen ``requests-cache``-Backend, weil CDX-Responses
-    für stark archivierte Domains das SQLite-BLOB-Limit sprengen können
-    (>1 GB → ``sqlite3.DataError``). Stattdessen gibt es einen file-basierten
-    Cache in ``.cache/cdx/`` (siehe ``_cdx_file_cache_path``).
-    """
     session = requests.Session()
     session.headers.update({"User-Agent": cfg.user_agent})
     return session
 
 
 def _make_html_session(cfg: Config) -> CachedSession:
-    """Baut eine CachedSession für HTML-Snapshots (ohne TTL, explizit geräumt)."""
     cfg.cache_dir.mkdir(parents=True, exist_ok=True)
     session = CachedSession(
         cache_name=str(cfg.http_cache_path.with_suffix("")),
         backend="sqlite",
-        expire_after=-1,  # kein automatisches Ablaufen
+        expire_after=-1,
         allowable_methods=("GET",),
         allowable_codes=(200,),
         stale_if_error=False,
@@ -2166,21 +1829,6 @@ def process_domain(
     cdx_session: requests.Session,
     html_session: CachedSession,
 ) -> DomainStats:
-    """Verarbeitet ein einzelnes Domain-Target: CDX → Sampling → Fetch/Parse → Output.
-
-    Schreibt laufend in ``state/<slug>.partial.jsonl``. Bei erfolgreichem
-    Abschluss wird dieser atomar nach ``output/<slug>.jsonl`` gemerged.
-
-    Args:
-        target: Die zu verarbeitende Domain-Spezifikation.
-        cfg: Konfiguration.
-        progress: Globales progress-Dict (wird mutiert und gespeichert).
-        cdx_session: Cached Session für CDX-Requests.
-        html_session: Cached Session für Snapshot-Fetches.
-
-    Returns:
-        ``DomainStats`` mit Laufzeitmetriken.
-    """
     raw = target.raw
     stats = DomainStats(domain=raw)
     stats.started_at = datetime.now().isoformat(timespec="seconds")
@@ -2188,57 +1836,40 @@ def process_domain(
 
     # 1) CDX abrufen
     try:
-        cdx_rows = fetch_cdx_index(
-            target, cdx_session, cfg.years, cfg.rate_limit, cfg
-        )
-    except Exception as exc:  # noqa: BLE001
+        cdx_rows = fetch_cdx_index(target, cdx_session, cfg.years, cfg.rate_limit, cfg)
+    except Exception as exc:
         err = f"{type(exc).__name__}: {exc}"
         logger.error("CDX-Fehler für {}: {}\n{}", raw, err, traceback.format_exc())
         log_skip("fetch_errors", raw, raw, f"cdx_failed: {err}")
         stats.errors += 1
         stats.finished_at = datetime.now().isoformat(timespec="seconds")
-        update_domain_progress(
-            cfg, progress, raw, stats, status="failed", error=err
-        )
+        update_domain_progress(cfg, progress, raw, stats, status="failed", error=err)
         return stats
 
     # 2) Gruppieren + Sampling
     url_year_map = group_captures_by_url_and_year(cdx_rows, cfg.years, target)
-    urls_sampled = sample_urls_per_year(
-        url_year_map, cfg.limit_urls_per_year, cfg.sample_seed
-    )
+    urls_sampled = sample_urls_per_year(url_year_map, cfg.limit_urls_per_year, cfg.sample_seed)
     stats.urls_total = len(urls_sampled)
 
-    # Diagnostik: warum wurden Captures aussortiert?
     n_raw = len(cdx_rows)
     n_path_excl = sum(
-        1
-        for r in cdx_rows
-        if is_excluded_path(r.original)
-        or urlparse(r.original).scheme not in ("http", "https")
+        1 for r in cdx_rows
+        if is_excluded_path(r.original) or urlparse(r.original).scheme not in ("http", "https")
     )
-    n_target_mismatch = sum(
-        1 for r in cdx_rows if not _url_matches_target(r.original, target)
-    )
+    n_target_mismatch = sum(1 for r in cdx_rows if not _url_matches_target(r.original, target))
     stats.skipped_path = n_path_excl
     logger.info(
         "Domain {}: cdx_rows={}, path_excl={}, target_mismatch={}, sampled={}",
-        raw,
-        n_raw,
-        n_path_excl,
-        n_target_mismatch,
-        len(urls_sampled),
+        raw, n_raw, n_path_excl, n_target_mismatch, len(urls_sampled),
     )
 
     if cfg.dry_run:
         logger.info("Dry-run: {} URLs ermittelt, kein Fetch.", len(urls_sampled))
         stats.finished_at = datetime.now().isoformat(timespec="seconds")
-        update_domain_progress(
-            cfg, progress, raw, stats, status="done", last_url=None
-        )
+        update_domain_progress(cfg, progress, raw, stats, status="done", last_url=None)
         return stats
 
-    # 3) Resume: Index des letzten verarbeiteten URL-Jahr-Paars bestimmen.
+    # 3) Resume
     partial_path = cfg.state_dir / f"{target.file_slug}.partial.jsonl"
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2251,11 +1882,8 @@ def process_domain(
                     start_index = i + 1
                     break
             if start_index:
-                logger.info(
-                    "Resume: überspringe {} bereits verarbeitete URLs", start_index
-                )
+                logger.info("Resume: überspringe {} bereits verarbeitete URLs", start_index)
     else:
-        # No-resume: partial.jsonl löschen.
         if partial_path.exists():
             partial_path.unlink()
 
@@ -2275,11 +1903,7 @@ def process_domain(
                     logger.warning("Shutdown requested, pausiere Domain {}", raw)
                     stats.finished_at = datetime.now().isoformat(timespec="seconds")
                     update_domain_progress(
-                        cfg,
-                        progress,
-                        raw,
-                        stats,
-                        status="in_progress",
+                        cfg, progress, raw, stats, status="in_progress",
                         last_url=progress.get(raw, {}).get("last_url"),
                     )
                     pbar.close()
@@ -2289,22 +1913,14 @@ def process_domain(
                 stats.urls_processed += 1
 
                 try:
-                    record = load_or_fetch_parsed(
-                        url, cdx_row.timestamp, html_session, cfg
-                    )
-                except Exception as exc:  # noqa: BLE001
+                    record = load_or_fetch_parsed(url, cdx_row.timestamp, html_session, cfg)
+                except Exception as exc:
                     stats.errors += 1
-                    log_skip(
-                        "fetch_errors",
-                        raw,
-                        url,
-                        f"unexpected: {type(exc).__name__}: {exc}",
-                    )
+                    log_skip("fetch_errors", raw, url, f"unexpected: {type(exc).__name__}: {exc}")
                     logger.debug("Traceback: {}", traceback.format_exc())
                     record = None
 
                 if record is None:
-                    # Harter Netzfehler, kein Cache-Eintrag.
                     pass
                 elif not record.parse_success:
                     reason = record.skip_reason or "unknown"
@@ -2313,125 +1929,65 @@ def process_domain(
                         log_skip("no_body", raw, url, "textextraktion fehlgeschlagen")
                     elif reason == "no_date":
                         stats.skipped_no_date += 1
-                        log_skip(
-                            "no_date", raw, url, "kein datePublished/dateModified"
-                        )
+                        log_skip("no_date", raw, url, "kein datePublished/dateModified")
                     elif reason == "wayback_404_or_error_page":
                         stats.errors += 1
-                        log_skip(
-                            "fetch_errors",
-                            raw,
-                            url,
-                            f"{reason} timestamp={cdx_row.timestamp}",
-                        )
+                        log_skip("fetch_errors", raw, url, f"{reason} timestamp={cdx_row.timestamp}")
                     else:
                         log_skip("fetch_errors", raw, url, reason)
                 else:
-                    # Erfolg: weiter prüfen (Jahr-Range, Sprache, Keywords).
                     assert record.date_iso is not None
                     try:
                         rec_date = date.fromisoformat(record.date_iso)
                     except ValueError:
                         stats.skipped_no_date += 1
-                        log_skip(
-                            "no_date", raw, url, f"invalid date_iso {record.date_iso}"
-                        )
+                        log_skip("no_date", raw, url, f"invalid date_iso {record.date_iso}")
                     else:
                         if rec_date.year not in cfg.years:
                             stats.skipped_no_date += 1
-                            log_skip(
-                                "no_date",
-                                raw,
-                                url,
-                                f"date {record.date_iso} outside range",
-                            )
+                            log_skip("no_date", raw, url, f"date {record.date_iso} outside range")
                         elif record.language not in ("de", "de_assumed"):
-                            # Alles andere (en, fr, …, too_short_unknown,
-                            # lang_error) → verwerfen. So bleiben wir wirklich
-                            # bei deutschen Artikeln, auch auf .com-Hosts.
                             stats.skipped_lang += 1
-                            log_skip(
-                                "lang_skipped",
-                                raw,
-                                url,
-                                f"language={record.language}",
-                            )
+                            log_skip("lang_skipped", raw, url, f"language={record.language}")
                         else:
                             body_text = record.body or ""
                             ai_tags = find_ai_keywords(body_text)
                             if not ai_tags:
                                 stats.skipped_no_keywords += 1
-                                log_skip(
-                                    "no_keywords",
-                                    raw,
-                                    url,
-                                    "keine AI_KEYWORDS im Body",
-                                )
+                                log_skip("no_keywords", raw, url, "keine AI_KEYWORDS im Body")
                             else:
                                 health_tags = find_health_keywords(body_text)
                                 if not health_tags:
                                     stats.skipped_no_health += 1
                                     log_skip(
-                                        "no_keywords",
-                                        raw,
-                                        url,
-                                        f"AI ok ({','.join(ai_tags)}) "
-                                        f"aber keine HEALTH_KEYWORDS im Body",
+                                        "no_keywords", raw, url,
+                                        f"AI ok ({','.join(ai_tags)}) aber keine HEALTH_KEYWORDS",
                                     )
                                 else:
-                                    out_rec = build_output_record(
-                                        record, raw, ai_tags, health_tags
-                                    )
-                                    partial_fh.write(
-                                        json.dumps(out_rec, ensure_ascii=False) + "\n"
-                                    )
+                                    out_rec = build_output_record(record, raw, ai_tags, health_tags)
+                                    partial_fh.write(json.dumps(out_rec, ensure_ascii=False) + "\n")
                                     partial_fh.flush()
                                     stats.hits += 1
 
-                # Progress aktualisieren (nach jeder URL).
                 last_key = f"{url}|{year}"
                 update_domain_progress(
-                    cfg,
-                    progress,
-                    raw,
-                    stats,
-                    status="in_progress",
-                    last_url=last_key,
+                    cfg, progress, raw, stats, status="in_progress", last_url=last_key,
                 )
-                pbar.set_postfix(
-                    year=year, hits=stats.hits, errors=stats.errors
-                )
+                pbar.set_postfix(year=year, hits=stats.hits, errors=stats.errors)
                 pbar.update(1)
     finally:
         pbar.close()
 
-    # 5) Abschluss: partial → output mergen.
+    # 5) Abschluss
     stats.finished_at = datetime.now().isoformat(timespec="seconds")
     try:
         lines = finalize_domain_output(cfg, target)
-        logger.info(
-            "Domain {} abgeschlossen: {} Treffer geschrieben", raw, lines
-        )
-        update_domain_progress(
-            cfg,
-            progress,
-            raw,
-            stats,
-            status="done",
-            last_url=None,
-            error=None,
-        )
-    except Exception as exc:  # noqa: BLE001
+        logger.info("Domain {} abgeschlossen: {} Treffer geschrieben", raw, lines)
+        update_domain_progress(cfg, progress, raw, stats, status="done", last_url=None, error=None)
+    except Exception as exc:
         err = f"{type(exc).__name__}: {exc}"
-        logger.error(
-            "Finalize für {} fehlgeschlagen: {}\n{}",
-            raw,
-            err,
-            traceback.format_exc(),
-        )
-        update_domain_progress(
-            cfg, progress, raw, stats, status="failed", error=err
-        )
+        logger.error("Finalize für {} fehlgeschlagen: {}\n{}", raw, err, traceback.format_exc())
+        update_domain_progress(cfg, progress, raw, stats, status="failed", error=err)
     return stats
 
 
@@ -2439,13 +1995,10 @@ def process_domain(
 
 
 def parse_args(argv: Optional[list[str]] = None) -> Config:
-    """Parst die CLI-Argumente und baut ein ``Config``-Objekt."""
     parser = argparse.ArgumentParser(
         description="Wayback-Crawler für deutsche KI-Berichterstattung"
     )
-    parser.add_argument(
-        "--input", type=Path, default=Path("root_domains.xlsx")
-    )
+    parser.add_argument("--input", type=Path, default=Path("root_domains_test.xlsx"))
     parser.add_argument("--output-dir", type=Path, default=Path("output"))
     resume_group = parser.add_mutually_exclusive_group()
     resume_group.add_argument("--resume", dest="resume", action="store_true")
@@ -2459,9 +2012,7 @@ def parse_args(argv: Optional[list[str]] = None) -> Config:
     parser.add_argument("--years", type=str, default="2015-2025")
     parser.add_argument("--user-agent", type=str, default=USER_AGENT_DEFAULT)
     args = parser.parse_args(argv)
-
     years = parse_years_range(args.years)
-
     return Config(
         input_path=args.input,
         output_dir=args.output_dir,
@@ -2477,10 +2028,8 @@ def parse_args(argv: Optional[list[str]] = None) -> Config:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    """Haupteinstieg. Gibt einen Exit-Code zurück (0=ok, nonzero=Fehler)."""
     cfg = parse_args(argv)
 
-    # Ordner anlegen
     for p in (cfg.output_dir, cfg.state_dir, cfg.logs_dir, cfg.cache_dir, cfg.parsed_cache_dir):
         p.mkdir(parents=True, exist_ok=True)
 
@@ -2489,17 +2038,12 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     logger.info(
         "Starte Crawler | input={} | years={}-{} | rate_limit={} req/s | resume={}",
-        cfg.input_path,
-        cfg.years[0],
-        cfg.years[-1],
-        cfg.rate_limit,
-        cfg.resume,
+        cfg.input_path, cfg.years[0], cfg.years[-1], cfg.rate_limit, cfg.resume,
     )
 
-    # Domains laden
     try:
         targets = load_domains(cfg.input_path)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.error("Domains konnten nicht geladen werden: {}", exc)
         return 2
 
@@ -2509,14 +2053,11 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     logger.info(
         "{} Domain-Targets geladen (davon {} mit explizitem Pfad-Präfix).",
-        len(targets),
-        sum(1 for t in targets if t.has_path_prefix),
+        len(targets), sum(1 for t in targets if t.has_path_prefix),
     )
 
-    # Sessions aufbauen
     cdx_session = _make_cdx_session(cfg)
     html_session = _make_html_session(cfg)
-
     progress = load_progress(cfg) if cfg.resume else {}
 
     global_stats: list[DomainStats] = []
@@ -2534,53 +2075,38 @@ def main(argv: Optional[list[str]] = None) -> int:
                 continue
 
             try:
-                stats = process_domain(
-                    target, cfg, progress, cdx_session, html_session
-                )
+                stats = process_domain(target, cfg, progress, cdx_session, html_session)
                 global_stats.append(stats)
-                # Pro-Domain-Summary
                 logger.info(
                     "Summary {}: total={} processed={} hits={} errors={} "
                     "no_date={} lang={} no_body={} no_ai_kw={} no_health_kw={}",
-                    target.raw,
-                    stats.urls_total,
-                    stats.urls_processed,
-                    stats.hits,
-                    stats.errors,
-                    stats.skipped_no_date,
-                    stats.skipped_lang,
-                    stats.skipped_no_body,
-                    stats.skipped_no_keywords,
-                    stats.skipped_no_health,
+                    target.raw, stats.urls_total, stats.urls_processed,
+                    stats.hits, stats.errors, stats.skipped_no_date,
+                    stats.skipped_lang, stats.skipped_no_body,
+                    stats.skipped_no_keywords, stats.skipped_no_health,
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 exit_code = 1
                 logger.error(
                     "Unerwarteter Fehler bei {}: {}\n{}",
-                    target.raw,
-                    exc,
-                    traceback.format_exc(),
+                    target.raw, exc, traceback.format_exc(),
                 )
-                # Weiter mit nächstem Target (Einzelfehler dürfen Lauf nicht stoppen).
                 continue
     finally:
         try:
             cdx_session.close()
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         try:
             html_session.close()
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
 
-    # Gesamtsumme
     total_hits = sum(s.hits for s in global_stats)
     total_processed = sum(s.urls_processed for s in global_stats)
     logger.info(
         "Lauf beendet: {} Domains, {} URLs verarbeitet, {} Treffer geschrieben",
-        len(global_stats),
-        total_processed,
-        total_hits,
+        len(global_stats), total_processed, total_hits,
     )
     if _shutdown_requested.is_set():
         return 130
