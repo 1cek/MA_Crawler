@@ -2293,7 +2293,7 @@ def parse_args(argv: Optional[list[str]] = None) -> Config:
         description="Wayback-Crawler für deutsche KI-Berichterstattung"
     )
     parser.add_argument(
-        "--input", type=Path, default=Path("260520_root_domains_AI.xlsx")
+        "--input", type=Path, default=Path("last_root_domains.xlsx")
     )
     parser.add_argument("--output-dir", type=Path, default=Path("output"))
     resume_group = parser.add_mutually_exclusive_group()
